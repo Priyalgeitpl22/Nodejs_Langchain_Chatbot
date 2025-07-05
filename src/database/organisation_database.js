@@ -78,23 +78,31 @@ const createCollectionTableIfNotExists = async (pool) => {
 
 
 const createEmbeddingTableIfNotExists = async (pool) => {
-  const query = `
-    CREATE TABLE IF NOT EXISTS langchain_pg_embedding (
-      id SERIAL PRIMARY KEY,
-      embedding VECTOR(1536), -- Adjust dimension based on your embedding model
-      metadata JSONB,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      content TEXT,
-      collection_id UUID REFERENCES langchain_collections(uuid)
-    )
-  `;
   const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+    
+    // First, create the pgvector extension if it doesn't exist
+    await client.query('CREATE EXTENSION IF NOT EXISTS vector');
+    
+    // Then create the embedding table
+    const query = `
+      CREATE TABLE IF NOT EXISTS langchain_pg_embedding (
+        id SERIAL PRIMARY KEY,
+        embedding VECTOR(1536), -- Adjust dimension based on your embedding model
+        metadata JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        content TEXT,
+        collection_id UUID REFERENCES langchain_collections(uuid)
+      )
+    `;
+    
     await client.query(query);
-    await pool.query('COMMIT');
-    console.log('Embedding table created or already exists.');
+    await client.query('COMMIT');
+    console.log('✅ Embedding table created or already exists.');
   } catch (e) {
-    await pool.query('ROLLBACK');
+    await client.query('ROLLBACK');
+    console.error('❌ Failed to create embedding table:', e.message);
     throw new Error(`Failed to create embedding table: ${e.message}`);
   } finally {
     client.release();

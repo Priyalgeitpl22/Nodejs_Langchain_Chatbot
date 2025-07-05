@@ -17,6 +17,21 @@ app.use(cors({
   allowedHeaders: ['*'],
 }));
 
+// Initialize database tables on startup
+const initializeDatabase = async () => {
+  const pool = connect();
+  try {
+    console.log('Initializing database tables...');
+    await createTableIfNotExists(pool);
+    await createCollectionTableIfNotExists(pool);
+    await createEmbeddingTableIfNotExists(pool);
+    console.log('Database tables initialized successfully.');
+  } catch (error) {
+    console.error('Error initializing database tables:', error);
+    throw error;
+  }
+};
+
 const logger = console;
 
 app.post('/api/organisation_database', async (req, res) => {
@@ -29,9 +44,6 @@ app.post('/api/organisation_database', async (req, res) => {
   const pool = connect();
 
   try {
-    await createTableIfNotExists(pool);
-    await createCollectionTableIfNotExists(pool);
-    await createEmbeddingTableIfNotExists(pool);
 
     const organisationDataFromFrontend = JSON.stringify(organisation_data);
 
@@ -66,8 +78,6 @@ app.post('/api/organisation_database', async (req, res) => {
   } catch (error) {
     console.error('Error:', error);
     res.status(500).json({ message: 'Error processing data', error: error.message });
-  } finally {
-    await close(pool);
   }
 });
 
@@ -98,6 +108,41 @@ app.post('/api/organisation_chatbot', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => logger.log(`Server running on port ${PORT}`));
+
+// Start server after database initialization
+const startServer = async () => {
+  try {
+    await initializeDatabase();
+    const server = app.listen(PORT, () => logger.log(`Server running on port ${PORT}`));
+    
+    // Graceful shutdown handler
+    const gracefulShutdown = async (signal) => {
+      console.log(`\nReceived ${signal}. Starting graceful shutdown...`);
+      
+      server.close(async () => {
+        console.log('HTTP server closed.');
+        try {
+          const pool = connect();
+          await close(pool);
+          console.log('Database pool closed.');
+          process.exit(0);
+        } catch (error) {
+          console.error('Error during shutdown:', error);
+          process.exit(1);
+        }
+      });
+    };
+
+    // Handle different shutdown signals
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+};
+
+startServer();
 
 export default app;

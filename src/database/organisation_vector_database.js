@@ -1,18 +1,8 @@
-import { Pool } from 'pg';
 import { PGVectorStore } from '@langchain/community/vectorstores/pgvector';
-import dotenv from 'dotenv';
-
-dotenv.config();
-
-const pool = new Pool({
-  user: process.env.DBUSER,
-  host: process.env.DBHOST,
-  database: process.env.DBNAME,
-  password: process.env.DBPW,
-  port: process.env.DBPORT,
-});
+import { connect } from './organisation_database.js';
 
 const getOrCreateCollection = async (collectionName, embeddings) => {
+  const pool = connect();
   return new PGVectorStore(embeddings, {
     pool,
     collectionName,
@@ -62,6 +52,7 @@ const deleteDocumentsFromCollection = async (collectionName, embeddings, organis
 
 const checkIfRecordExists = async (organisationId) => {
   try {
+    const pool = connect();
     const result = await pool.query('SELECT EXISTS (SELECT 1 FROM langchain_pg_embedding WHERE id = $1 LIMIT 1)', [organisationId]);
     return { is_rec_exist: result.rows[0].exists };
   } catch (e) {
