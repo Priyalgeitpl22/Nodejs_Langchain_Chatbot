@@ -81,4 +81,32 @@ You are an AI assistant for Organisation. Your task is to answer user questions 
 
 ---`;
 
-export { ACT_PROMPT };
+const chatSummaryPrompt = (messages)=> {
+const transcript = messages.map((msg) => `${msg.sender}: ${msg.content}`).join('\n');
+
+
+const prompt = `
+You are a support chat analyst AI.
+
+Given the following chat transcript between a user and support (AI or human agent), perform the following:
+
+1. Provide a 2-4 line summary of the conversation.
+2. Identify the main intent of the customer (e.g., Refund Request, Product Inquiry, Complaint, General Question, Technical Issue, etc.).
+3. Give a customer satisfaction score from 1 (very dissatisfied) to 5 (very satisfied).
+4. Briefly explain the reason for the satisfaction score.
+
+### Chat Transcript:
+${transcript}
+
+### Output Format (JSON):
+{
+  "summary": "...",
+  "intent": "...",
+  "satisfaction_score": 4,
+  "satisfaction_reason": "..."
+}
+`;
+return prompt
+}
+
+export { ACT_PROMPT ,chatSummaryPrompt};

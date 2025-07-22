@@ -127,7 +127,7 @@ const chatBot = (temperature = 0.7) => {
       const ragChain = prompt.pipe(chatModel).pipe(new JsonOutputParser());
 
       const chainWithHistory = new RunnableWithMessageHistory({
-        runnable: ragChain,
+        runnable: ragChain,   
         getMessageHistory: async (sessionId) => ({
           async getMessages() {
             const history = await chatHistory.getMessages();
