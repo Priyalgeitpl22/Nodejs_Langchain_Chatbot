@@ -1002,55 +1002,95 @@ async function callExternalApi(state) {
     console.log('📡 [callExternalApi] Using LLM to analyze API response and answer query');
     
     let answer;
+    let nameParts = []; // Declare outside for use in validation
     try {
+      // Pre-filter data for person queries to speed up LLM processing
+      let dataToAnalyze = apiResponse;
+      const queryLower = state.user_query.toLowerCase();
+      const isPersonQuery = /who is|tell me about|what is.*in|about.*in/i.test(state.user_query);
+      
+      if (isPersonQuery && Array.isArray(apiResponse)) {
+        // Extract name parts from query
+        nameParts = queryLower
+          .replace(/who is|tell me about|what is|about/gi, '')
+          .replace(/in|at|the|golden|eagle/gi, '')
+          .trim()
+          .split(/\s+/)
+          .filter(part => part.length > 2);
+        
+        if (nameParts.length > 0) {
+          console.log('📡 [callExternalApi] Person query detected, searching for:', nameParts);
+          // Search for matching items
+          const matches = [];
+          apiResponse.forEach(item => {
+            const itemText = JSON.stringify(item).toLowerCase();
+            const hasMatch = nameParts.some(part => itemText.includes(part));
+            if (hasMatch) {
+              matches.push(item);
+            }
+          });
+          
+          if (matches.length > 0) {
+            console.log('📡 [callExternalApi] Found', matches.length, 'matching items, using those for LLM');
+            dataToAnalyze = matches;
+          } else {
+            console.log('📡 [callExternalApi] No matches found, using all data');
+          }
+        }
+      }
+      
       const chatModel = createChatModel(state.openai_api_key);
       const analysisPrompt = ChatPromptTemplate.fromMessages([
-        ['system', `You are a helpful assistant. Analyze the COMPLETE API response data and answer the user's query based on that data. 
+        ['system', `You are a helpful assistant. Answer the user's query DIRECTLY and CONCISELY based on the API data provided.
 
-CRITICAL INSTRUCTIONS:
-- You have been provided with the COMPLETE API response data - search through ALL of it
-- If the data is an array, you must examine EVERY SINGLE ITEM in the array, not just the first few
-- If the query asks about a specific person/thing, search through ALL items in the array to find them
-- Check ALL fields in each item: firstname, lastname, email, manager_name, hr_manager_name, user.firstname, user.lastname, etc.
-- Names may appear in different formats - search for partial matches (e.g., "Isha" or "Agrawal" separately)
-- Provide a clear, concise, and human-readable answer based on what you find
-- If you find the person, describe their role, designation, status, manager, and any relevant details
-- If the query asks for a list, provide a formatted list
-- Be conversational and natural in your response
-- Only use information from the provided API data
-- IMPORTANT: The data provided is COMPLETE - search through ALL of it thoroughly`],
+CRITICAL RULES - YOU MUST FOLLOW THESE:
+1. If the query asks "who is [person name]", find that person and answer ONLY about them:
+   - Format: "[Name] is [role/designation] at [company]. [Key details: status, manager, etc.]"
+   - DO NOT list all employees or other people
+   - DO NOT show a numbered list unless specifically asked for a list
+
+2. If the query asks for a list/count, provide a summary:
+   - "There are X employees" or list the requested items only
+   - DO NOT list everything unless explicitly asked
+
+3. Search through ALL provided data to find the answer
+4. Check all fields: firstname, lastname, email, manager_name, hr_manager_name, user.firstname, user.lastname, designation, status
+5. Names may appear in different formats - search for partial matches
+6. Be conversational, concise, and natural
+7. ONLY provide the specific answer requested - nothing more
+8. DO NOT output formatted lists unless the query explicitly asks for a list`],
         ['human', `User Query: {query}
 
-COMPLETE API Response Data (search through ALL items):
+API Response Data:
 {apiData}
 
-IMPORTANT: This is the COMPLETE API response. Search through EVERY SINGLE ITEM in the data above to answer the user's query. Do not skip any items.`]
+Answer the user's query directly and concisely. If asking about a specific person, provide ONLY information about that person. Do NOT list all items.`]
       ]);
       
-      // Send the COMPLETE API response to LLM - don't truncate
-      // Modern LLMs can handle large contexts, so send everything
-      let apiDataForLLM = JSON.stringify(apiResponse);
+      // Prepare data for LLM - use filtered data if available
+      let apiDataForLLM = JSON.stringify(dataToAnalyze);
+      const maxLength = 50000; // Reasonable limit for performance
       
-      // Only truncate if it's extremely large (over 100k chars) - but still send a large sample
-      const maxLength = 100000; // Much larger limit
       if (apiDataForLLM.length > maxLength) {
-        console.log('📡 [callExternalApi] Response is very large (' + apiDataForLLM.length + ' chars), but sending as much as possible');
-        // For very large arrays, send a larger sample
-        if (Array.isArray(apiResponse)) {
-          // Send first 100 items instead of just 10
-          const sampleSize = Math.min(100, apiResponse.length);
-          const sample = apiResponse.slice(0, sampleSize);
-          apiDataForLLM = JSON.stringify({
-            total_count: apiResponse.length,
-            items_sent: sampleSize,
-            data: sample,
-            note: `Sending ${sampleSize} of ${apiResponse.length} items. Please search through ALL items provided.`
-          });
+        console.log('📡 [callExternalApi] Data is large (' + apiDataForLLM.length + ' chars), truncating');
+        if (Array.isArray(dataToAnalyze)) {
+          // If we have filtered matches, send all of them (up to limit)
+          if (dataToAnalyze.length <= 50) {
+            apiDataForLLM = JSON.stringify(dataToAnalyze);
+          } else {
+            // Send first 50 matches
+            const sample = dataToAnalyze.slice(0, 50);
+            apiDataForLLM = JSON.stringify({
+              total_matches: dataToAnalyze.length,
+              data: sample,
+              note: `Showing ${sample.length} of ${dataToAnalyze.length} matches`
+            });
+          }
         } else {
           apiDataForLLM = apiDataForLLM.substring(0, maxLength);
         }
       } else {
-        console.log('📡 [callExternalApi] Sending complete API response to LLM (' + apiDataForLLM.length + ' characters)');
+        console.log('📡 [callExternalApi] Sending', Array.isArray(dataToAnalyze) ? dataToAnalyze.length + ' items' : 'data', 'to LLM');
       }
       
       const analysisChain = analysisPrompt.pipe(chatModel);
@@ -1059,14 +1099,26 @@ IMPORTANT: This is the COMPLETE API response. Search through EVERY SINGLE ITEM i
         apiData: apiDataForLLM
       });
       
-      answer = llmResponse.content;
-      console.log('📡 [callExternalApi] LLM generated answer from API data');
+      answer = llmResponse.content?.trim();
+      console.log('📡 [callExternalApi] LLM generated answer:', answer?.substring(0, 100) + '...');
       
-      // Validate that we got a meaningful answer
+      // Validate LLM answer - reject if it looks like a full list
       if (!answer || answer.trim().length === 0) {
         console.log('📡 [callExternalApi] LLM returned empty answer, falling back to formatting');
-        // Fallback to formatting if LLM fails
         answer = formatArrayResponse(Array.isArray(apiResponse) ? apiResponse : (apiResponse.data || apiResponse.results || []));
+      } else if (answer.includes('I found') && answer.includes('results') && answer.split('\n').length > 10) {
+        // If LLM returned a full list, try to extract just the answer
+        console.log('📡 [callExternalApi] LLM returned a list, extracting concise answer');
+        // For person queries, try to find the person info in the response
+        if (isPersonQuery) {
+          const lines = answer.split('\n');
+          const personLine = lines.find(line => 
+            nameParts.some(part => line.toLowerCase().includes(part))
+          );
+          if (personLine) {
+            answer = personLine.replace(/^\d+\.\s*/, '').trim();
+          }
+        }
       }
     } catch (llmError) {
       console.error('📡 [callExternalApi] Error using LLM to analyze response:', llmError);
