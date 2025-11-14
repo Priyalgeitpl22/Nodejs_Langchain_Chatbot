@@ -998,34 +998,84 @@ async function callExternalApi(state) {
     
     console.log('📡 [callExternalApi] API response received:', JSON.stringify(apiResponse).substring(0, 200) + '...');
     
-    // Extract answer from API response - support multiple formats
-    let answer = apiResponse.answer || apiResponse.response || apiResponse.data?.answer || apiResponse.message || apiResponse.text;
+    // Use LLM to analyze API response and answer the user's query
+    console.log('📡 [callExternalApi] Using LLM to analyze API response and answer query');
     
-    // If no direct answer field, format the response appropriately
-    if (!answer) {
-      if (typeof apiResponse === 'string') {
-        answer = apiResponse;
-      } else if (Array.isArray(apiResponse)) {
-        // If response is an array, format it as a nice list
-        console.log('📡 [callExternalApi] Formatting array response with', apiResponse.length, 'items');
-        answer = formatArrayResponse(apiResponse);
-      } else if (apiResponse.data && Array.isArray(apiResponse.data)) {
-        // If response has a data field that's an array
-        console.log('📡 [callExternalApi] Formatting array response from data field with', apiResponse.data.length, 'items');
-        answer = formatArrayResponse(apiResponse.data);
-      } else if (apiResponse.results && Array.isArray(apiResponse.results)) {
-        // If response has a results field that's an array
-        console.log('📡 [callExternalApi] Formatting array response from results field with', apiResponse.results.length, 'items');
-        answer = formatArrayResponse(apiResponse.results);
-      } else {
-        // For other object responses, format in human-readable way
-        console.log('📡 [callExternalApi] Formatting object response');
-        answer = formatObjectResponse(apiResponse);
+    let answer;
+    try {
+      const chatModel = createChatModel(state.openai_api_key);
+      const analysisPrompt = ChatPromptTemplate.fromMessages([
+        ['system', `You are a helpful assistant. Analyze the API response data and answer the user's query based on that data. 
+        
+- If the data is an array, analyze it to answer the query appropriately
+- Provide a clear, concise, and human-readable answer
+- If the query asks about a specific person/thing, find relevant information about them
+- If the query asks for a list, provide a formatted list
+- Be conversational and natural in your response
+- Only use information from the provided API data`],
+        ['human', `User Query: {query}
+
+API Response Data:
+{apiData}
+
+Based on the API response data above, please answer the user's query in a clear and helpful way.`]
+      ]);
+      
+      // Prepare API data for LLM (truncate if too large)
+      let apiDataForLLM = JSON.stringify(apiResponse);
+      const maxLength = 8000; // Limit to avoid token issues
+      if (apiDataForLLM.length > maxLength) {
+        // If it's an array, keep first few items and summary
+        if (Array.isArray(apiResponse)) {
+          const sampleSize = Math.min(10, apiResponse.length);
+          const sample = apiResponse.slice(0, sampleSize);
+          apiDataForLLM = JSON.stringify({
+            total_count: apiResponse.length,
+            sample_data: sample,
+            note: `Showing ${sampleSize} of ${apiResponse.length} items`
+          });
+        } else {
+          apiDataForLLM = apiDataForLLM.substring(0, maxLength) + '... (truncated)';
+        }
       }
-    } else if (Array.isArray(answer)) {
-      // If answer field itself is an array
-      console.log('📡 [callExternalApi] Formatting array answer with', answer.length, 'items');
-      answer = formatArrayResponse(answer);
+      
+      const analysisChain = analysisPrompt.pipe(chatModel);
+      const llmResponse = await analysisChain.invoke({
+        query: state.user_query,
+        apiData: apiDataForLLM
+      });
+      
+      answer = llmResponse.content;
+      console.log('📡 [callExternalApi] LLM generated answer from API data');
+      
+      // Validate that we got a meaningful answer
+      if (!answer || answer.trim().length === 0) {
+        console.log('📡 [callExternalApi] LLM returned empty answer, falling back to formatting');
+        // Fallback to formatting if LLM fails
+        answer = formatArrayResponse(Array.isArray(apiResponse) ? apiResponse : (apiResponse.data || apiResponse.results || []));
+      }
+    } catch (llmError) {
+      console.error('📡 [callExternalApi] Error using LLM to analyze response:', llmError);
+      console.log('📡 [callExternalApi] Falling back to direct formatting');
+      
+      // Fallback to direct formatting if LLM fails
+      answer = apiResponse.answer || apiResponse.response || apiResponse.data?.answer || apiResponse.message || apiResponse.text;
+      
+      if (!answer) {
+        if (typeof apiResponse === 'string') {
+          answer = apiResponse;
+        } else if (Array.isArray(apiResponse)) {
+          answer = formatArrayResponse(apiResponse);
+        } else if (apiResponse.data && Array.isArray(apiResponse.data)) {
+          answer = formatArrayResponse(apiResponse.data);
+        } else if (apiResponse.results && Array.isArray(apiResponse.results)) {
+          answer = formatArrayResponse(apiResponse.results);
+        } else {
+          answer = formatObjectResponse(apiResponse);
+        }
+      } else if (Array.isArray(answer)) {
+        answer = formatArrayResponse(answer);
+      }
     }
     
     // Validate that we got a meaningful answer
