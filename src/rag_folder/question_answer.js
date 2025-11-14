@@ -238,20 +238,39 @@ const ChatBotState = {
   tool_calls:[],
   task_creation: false,
   connect_agent: false,
+  openai_api_key: null,
 };
 
 
-const chatModel = new ChatOpenAI({
-  apiKey: OPENAI_API_KEY,
-  model: OPENAI_MODEL_NAME,
-  temperature: OPENAI_TEMPERATURE,
-});
+// Function to get the appropriate API key with logging
+const getApiKey = (dynamicKey) => {
+  const apiKey = dynamicKey || OPENAI_API_KEY;
+  const keySource = dynamicKey ? 'dynamic (from request)' : 'default (from environment)';
+  const maskedKey = apiKey ? `${apiKey.substring(0, 8)}...${apiKey.substring(apiKey.length - 4)}` : 'undefined';
+  
+  console.log(`🔑 Using OpenAI API key: ${maskedKey} (${keySource})`);
+  return apiKey;
+};
 
-const embeddingModel = new OpenAIEmbeddings({
-  model: 'text-embedding-3-large',
-  apiKey: OPENAI_API_KEY,
-  dimensions: DIMENSION,
-});
+// Function to create chat model with dynamic API key
+const createChatModel = (apiKey) => {
+  const key = getApiKey(apiKey);
+  return new ChatOpenAI({
+    apiKey: key,
+    model: OPENAI_MODEL_NAME,
+    temperature: OPENAI_TEMPERATURE,
+  });
+};
+
+// Function to create embedding model with dynamic API key
+const createEmbeddingModel = (apiKey) => {
+  const key = getApiKey(apiKey);
+  return new OpenAIEmbeddings({
+    model: 'text-embedding-3-large',
+    apiKey: key,
+    dimensions: DIMENSION,
+  });
+};
 
 // Node: Initialize chat history
 async function initializeChatHistory(state) {
@@ -307,6 +326,7 @@ async function initializeChatHistory(state) {
 async function retrieveDocuments(state) {
   try {
     const collectionName = `org-${state.organisation_id}`;
+    const embeddingModel = createEmbeddingModel(state.openai_api_key);
     const vectorStore = await getOrCreateCollection(collectionName, embeddingModel);
     const retriever = vectorStore.asRetriever({
       searchType: 'mmr',
@@ -381,6 +401,7 @@ async function generateResponse(state) {
       ['human', '{chat_history}\n\nContext:\n{context}\n\nQuestion:\n{question}'],
     ]);
 
+    const chatModel = createChatModel(state.openai_api_key);
     const ragChain = prompt.pipe(chatModel).pipe(new JsonOutputParser());
 
     const historyDb = await connectHistoryDb();
@@ -448,12 +469,15 @@ const app = graph.compile();
 // Main function to invoke the graph
 const getResponse = async (data) => {
   try {
+    console.log('🚀 Starting chat processing with API key:', data.openai_api_key ? 'dynamic' : 'default');
+    
     const result = await app.invoke({
       organisation_id: data.organisation_id,
       user_query: data.user_query,
       faqs: data.faqs || [],
       agents_available: data.agents_available || false,
       available_agents: data.available_agents || [],
+      openai_api_key: data.openai_api_key || null,
     });
     return result;
   } catch (error) {
