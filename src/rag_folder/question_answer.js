@@ -241,6 +241,7 @@ const ChatBotState = {
   connect_agent: false,
   openai_api_key: null,
   route: null, // "api" or "rag"
+  matched_api_config: null, // API config matched by checkApiTrigger
 };
 
 
@@ -828,51 +829,60 @@ async function checkApiTrigger(state) {
   try {
     console.log('🔀 [checkApiTrigger] Starting router decision');
     let route = "rag"; // default route
+    let matchedApiConfig = null;
     
     if (state.dynamic_data && state.dynamic_data.length > 0) {
       console.log('🔀 [checkApiTrigger] Checking dynamic_data for API config, items:', state.dynamic_data.length);
-      // Find item with prompt and either apiCurl or apiUrl
-      const apiConfig = state.dynamic_data.find(item => 
+      // Find all items with prompt and either apiCurl or apiUrl
+      const apiConfigs = state.dynamic_data.filter(item => 
         typeof item === 'object' && item !== null && item.prompt && (item.apiCurl || item.apiUrl)
       );
       
-      if (apiConfig) {
-        console.log('🔀 [checkApiTrigger] Found API config with prompt:', apiConfig.prompt);
-        console.log('🔀 [checkApiTrigger] API type:', apiConfig.apiCurl ? 'curl' : 'simple URL');
-        console.log('🔀 [checkApiTrigger] Using LLM to check if query matches prompt');
-        // Use LLM to check if user query is related to the prompt
+      if (apiConfigs.length > 0) {
+        console.log('🔀 [checkApiTrigger] Found', apiConfigs.length, 'API config(s), checking each for match');
+        // Use LLM to check which API config matches the query
         const chatModel = createChatModel(state.openai_api_key);
         const checkPrompt = ChatPromptTemplate.fromMessages([
           ['system', `You are a routing assistant. Determine if the user query is related to the given prompt/topic.
 
-IMPORTANT: Be LENIENT. If the query is asking about the same general topic/domain as the prompt, respond "yes".
+Be LENIENT and GENERAL. If the query is asking about the same general topic/domain as the prompt, respond "yes".
 
 Examples:
 - Prompt: "user information", Query: "get users" → YES
-- Prompt: "user information", Query: "tell me the age of Michael Williams from users list" → YES (asking about a user)
+- Prompt: "user information", Query: "tell me the age of Michael Williams from users list" → YES
 - Prompt: "user information", Query: "list all users" → YES
-- Prompt: "employee information", Query: "who is John in the company" → YES (asking about an employee)
-- Prompt: "user information", Query: "what is the weather today" → NO (completely different topic)
+- Prompt: "employee information", Query: "who is John in the company" → YES
+- Prompt: "employee information", Query: "list employees" → YES
+- Prompt: "user information", Query: "what is the weather today" → NO
 
-If the query is about the same domain/topic as the prompt, even if worded differently, respond "yes".
+If the query is about the same domain/topic as the prompt, respond "yes".
 Respond with only "yes" or "no".`],
-          ['human', 'Prompt/Topic: {prompt}\n\nUser Query: {query}\n\nIs the user query related to the prompt? Be lenient - if it\'s about the same topic/domain, say yes. Respond with only "yes" or "no".']
+          ['human', 'Prompt/Topic: {prompt}\n\nUser Query: {query}\n\nIs the user query related to the prompt? Be lenient - if it\'s about the same general topic/domain, say yes. Respond with only "yes" or "no".']
         ]);
         
         const chain = checkPrompt.pipe(chatModel);
-        const response = await chain.invoke({
-          prompt: apiConfig.prompt,
-          query: state.user_query
-        });
         
-        const isRelated = response.content?.toLowerCase().trim().startsWith('yes');
-        console.log('🔀 [checkApiTrigger] LLM response:', response.content, '| Is related:', isRelated);
+        // Check each API config to find a match
+        for (const apiConfig of apiConfigs) {
+          console.log('🔀 [checkApiTrigger] Checking config with prompt:', apiConfig.prompt);
+          const response = await chain.invoke({
+            prompt: apiConfig.prompt,
+            query: state.user_query
+          });
+          
+          const isRelated = response.content?.toLowerCase().trim().startsWith('yes');
+          console.log('🔀 [checkApiTrigger] LLM response for prompt "' + apiConfig.prompt + '":', response.content, '| Is related:', isRelated);
+          
+          if (isRelated) {
+            matchedApiConfig = apiConfig;
+            route = "api";
+            console.log('🔀 [checkApiTrigger] ✅ Found matching API config, routing to API path');
+            break; // Stop checking once we find a match
+          }
+        }
         
-        if (isRelated) {
-          route = "api";
-          console.log('🔀 [checkApiTrigger] ✅ Routing to API path');
-        } else {
-          console.log('🔀 [checkApiTrigger] ❌ Query not related to prompt, routing to RAG path');
+        if (route === "rag") {
+          console.log('🔀 [checkApiTrigger] ❌ No API config matched the query, routing to RAG path');
         }
       } else {
         console.log('🔀 [checkApiTrigger] No API config (prompt + apiCurl/apiUrl) found in dynamic_data');
@@ -882,7 +892,7 @@ Respond with only "yes" or "no".`],
     }
     
     console.log('🔀 [checkApiTrigger] Final route decision:', route);
-    return { route };
+    return { route, matched_api_config: matchedApiConfig };
   } catch (error) {
     console.error('Error in checkApiTrigger:', error);
     return { route: "rag" };
@@ -893,10 +903,14 @@ Respond with only "yes" or "no".`],
 async function callExternalApi(state) {
   try {
     console.log('📡 [callExternalApi] Starting external API call');
-    // Find API configuration from dynamic_data with prompt and either apiCurl or apiUrl
-    const apiConfig = state.dynamic_data.find(item => 
-      typeof item === 'object' && item !== null && item.prompt && (item.apiCurl || item.apiUrl)
-    );
+    // Use matched API config from checkApiTrigger, or find it if not set
+    let apiConfig = state.matched_api_config;
+    if (!apiConfig) {
+      // Fallback: find API configuration from dynamic_data
+      apiConfig = state.dynamic_data?.find(item => 
+        typeof item === 'object' && item !== null && item.prompt && (item.apiCurl || item.apiUrl)
+      );
+    }
     
     if (!apiConfig) {
       throw new Error('No API configuration (apiCurl or apiUrl) found in dynamic_data');
