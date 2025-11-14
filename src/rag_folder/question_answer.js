@@ -244,14 +244,9 @@ const ChatBotState = {
 };
 
 
-// Function to get the appropriate API key with logging
+// Function to get the appropriate API key
 const getApiKey = (dynamicKey) => {
-  const apiKey = dynamicKey || OPENAI_API_KEY;
-  const keySource = dynamicKey ? 'dynamic (from request)' : 'default (from environment)';
-  const maskedKey = apiKey ? `${apiKey.substring(0, 8)}...${apiKey.substring(apiKey.length - 4)}` : 'undefined';
-  
-  console.log(`🔑 Using OpenAI API key: ${maskedKey} (${keySource})`);
-  return apiKey;
+  return dynamicKey || OPENAI_API_KEY;
 };
 
 // Function to create chat model with dynamic API key
@@ -277,16 +272,18 @@ const createEmbeddingModel = (apiKey) => {
 // Node: Initialize chat history
 async function initializeChatHistory(state) {
   try {
+    console.log('📚 [initializeChatHistory] Starting chat history initialization for org:', state.organisation_id);
     const historyDb = await connectHistoryDb();
     const chatHistory = await getSessionChatHistory(state.organisation_id);
-    const organisationId = state.organisation_id.replace(/-/g, '').padEnd(32, '0');
 
     if (!(await checkOrganisationInSession(historyDb, state.organisation_id))) {
+      console.log('📚 [initializeChatHistory] New session detected, initializing with organisation_data');
       await chatHistory.addMessage(new HumanMessage({ name: state.organisation_id, content: 'organisation_data' }));
       await chatHistory.addMessage(new AIMessage({ name: state.organisation_id, content: 'organisation_data' }));
     }
 
     const historyMessages = await chatHistory.getMessages();
+    console.log('📚 [initializeChatHistory] Loaded', historyMessages.length, 'messages from history');
     const messages = historyMessages.map(msg => {
       if (msg && typeof msg === 'object' && msg.kwargs && msg.kwargs.content) {
         try {
@@ -309,11 +306,9 @@ async function initializeChatHistory(state) {
             });
           }
         } catch (e) {
-          console.error('Error processing message:', msg, e);
           return null;
         }
       }
-      console.warn('Skipping invalid message:', msg);
       return null;
     }).filter(msg => msg !== null);
 
@@ -327,18 +322,19 @@ async function initializeChatHistory(state) {
 // Node: Retrieve documents (using dynamic_data)
 async function retrieveDocuments(state) {
   try {
-    // Use dynamic_data if available, otherwise use vector store
+    console.log('🔍 [retrieveDocuments] Starting document retrieval for query:', state.user_query);
     let documents = [];
     
-    if (state.dynamic_data && state.dynamic_data.length > 0) {
-      console.log('Using dynamic_data for document retrieval:', state.dynamic_data);
-      // Convert dynamic_data to document format if needed
-      documents = state.dynamic_data.map(item => ({
-        pageContent: typeof item === 'string' ? item : JSON.stringify(item),
-        metadata: {}
-      }));
+    // Skip document retrieval if dynamic_data has prompt and apiCurl (will use API route)
+    const hasApiConfig = state.dynamic_data && state.dynamic_data.some(item => 
+      typeof item === 'object' && item !== null && (item.prompt && item.apiCurl)
+    );
+    
+    if (hasApiConfig) {
+      console.log('🔍 [retrieveDocuments] API config detected, skipping vector store retrieval');
     } else {
-      // Fallback to vector store retrieval
+      console.log('🔍 [retrieveDocuments] Using vector store retrieval');
+      // Use vector store retrieval
       const collectionName = `org-${state.organisation_id}`;
       const embeddingModel = createEmbeddingModel(state.openai_api_key);
       const vectorStore = await getOrCreateCollection(collectionName, embeddingModel);
@@ -349,13 +345,10 @@ async function retrieveDocuments(state) {
           k: 4,
         },
       });
-
-      console.log('Retriever:', retriever);
-      console.log('Query:', state.user_query);
       documents = await retriever.getRelevantDocuments(state.user_query);
+      console.log('🔍 [retrieveDocuments] Retrieved', documents.length, 'documents from vector store');
     }
     
-    console.log('Retrieved Documents:', documents);
     return { documents };
   } catch (error) {
     console.error('Error in retrieveDocuments:', error);
@@ -365,9 +358,9 @@ async function retrieveDocuments(state) {
 
 // Node: Filter FAQs
 async function filterFAQs(state) {
+  console.log('❓ [filterFAQs] Filtering FAQs, total FAQs:', state.faqs?.length || 0);
   let relevantFAQs = [];
   if (state.faqs && state.faqs.length > 0) {
-    console.log('Searching through', state.faqs.length, 'FAQs');
     relevantFAQs = state.faqs.filter(faq => {
       const question = faq.question?.toLowerCase() || '';
       const answer = faq.answer?.toLowerCase() || '';
@@ -375,13 +368,14 @@ async function filterFAQs(state) {
       const queryWords = query.split(' ').filter(word => word.length > 2);
       return queryWords.some(word => question.includes(word) || answer.includes(word));
     });
-    console.log('Found', relevantFAQs.length, 'relevant FAQs');
+    console.log('❓ [filterFAQs] Found', relevantFAQs.length, 'relevant FAQs');
   }
   return { faqs: relevantFAQs };
 }
 
 // Node: Create context
 async function createContext(state) {
+  console.log('📝 [createContext] Creating context from documents and FAQs');
   const documentContext = state.documents.map(doc => doc.pageContent).join('\n\n');
   const faqContext = state.faqs.length > 0
     ? '\n\nRelevant FAQs:\n' + state.faqs.map(faq => `Q: ${faq.question}\nA: ${faq.answer}`).join('\n\n')
@@ -401,101 +395,247 @@ async function createContext(state) {
     agentInfo = '\n\nAgent Information: No agents currently available';
   }
 
-  console.log('Agent Info being sent to AI:', agentInfo);
-  console.log('FAQ context being sent to AI:', faqContext ? 'Yes' : 'No');
-
   const fullContext = documentContext + faqContext + agentInfo;
+  console.log('📝 [createContext] Context created, length:', fullContext.length, 'characters');
   return { context: fullContext };
+}
+
+// Helper function to parse curl command
+function parseCurl(curlString) {
+  const result = {
+    url: null,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: null
+  };
+
+  try {
+    // Extract URL - handle various formats
+    const urlPatterns = [
+      /curl\s+(?:-X\s+\w+\s+)?['"]?([^\s'"]+)['"]?/,
+      /curl\s+['"]?([^'"]+)['"]?/,
+      /['"]?https?:\/\/[^\s'"]+['"]?/
+    ];
+    
+    for (const pattern of urlPatterns) {
+      const urlMatch = curlString.match(pattern);
+      if (urlMatch && urlMatch[1] && urlMatch[1].startsWith('http')) {
+        result.url = urlMatch[1].replace(/['"]/g, '');
+        break;
+      }
+    }
+
+    // Extract method
+    const methodMatch = curlString.match(/-X\s+(\w+)/i);
+    if (methodMatch) {
+      result.method = methodMatch[1].toUpperCase();
+    }
+
+    // Extract headers - handle both quoted and unquoted
+    const headerPatterns = [
+      /-H\s+['"]([^'"]+)['"]/g,
+      /-H\s+([^\s]+)/g,
+      /--header\s+['"]([^'"]+)['"]/g
+    ];
+    
+    for (const pattern of headerPatterns) {
+      const headerMatches = curlString.matchAll(pattern);
+      for (const match of headerMatches) {
+        const headerStr = match[1].replace(/['"]/g, '');
+        const colonIndex = headerStr.indexOf(':');
+        if (colonIndex > 0) {
+          const key = headerStr.substring(0, colonIndex).trim();
+          const value = headerStr.substring(colonIndex + 1).trim();
+          if (key && value) {
+            result.headers[key] = value;
+          }
+        }
+      }
+    }
+
+    // Extract body/data - handle various formats
+    const dataPatterns = [
+      /(?:-d|--data|--data-raw)\s+['"]([^'"]+)['"]/,
+      /(?:-d|--data|--data-raw)\s+([^\s]+)/,
+      /--data-binary\s+['"]([^'"]+)['"]/
+    ];
+    
+    for (const pattern of dataPatterns) {
+      const dataMatch = curlString.match(pattern);
+      if (dataMatch) {
+        const dataStr = dataMatch[1].replace(/['"]/g, '');
+        try {
+          result.body = JSON.parse(dataStr);
+        } catch {
+          result.body = dataStr;
+        }
+        break;
+      }
+    }
+  } catch (error) {
+    console.error('Error parsing curl:', error);
+  }
+
+  return result;
 }
 
 // Node: Check API Trigger (MODEL ROUTER)
 async function checkApiTrigger(state) {
   try {
-    // Determine route based on dynamic_data or other conditions
-    // If dynamic_data contains API configuration, route to "api"
-    // Otherwise, route to "rag"
+    console.log('🔀 [checkApiTrigger] Starting router decision');
     let route = "rag"; // default route
     
     if (state.dynamic_data && state.dynamic_data.length > 0) {
-      // Check if dynamic_data contains API configuration
-      const hasApiConfig = state.dynamic_data.some(item => {
-        if (typeof item === 'object' && item !== null) {
-          return item.api_url || item.api_endpoint || item.route === 'api';
-        }
-        return false;
-      });
-      
-      // Check if dynamic_data explicitly specifies route
-      const explicitRoute = state.dynamic_data.find(item => 
-        typeof item === 'object' && item !== null && (item.route === 'api' || item.route === 'rag')
+      console.log('🔀 [checkApiTrigger] Checking dynamic_data for API config, items:', state.dynamic_data.length);
+      // Find item with prompt and apiCurl
+      const apiConfig = state.dynamic_data.find(item => 
+        typeof item === 'object' && item !== null && item.prompt && item.apiCurl
       );
       
-      if (explicitRoute) {
-        route = explicitRoute.route;
-      } else if (hasApiConfig) {
-        route = "api";
+      if (apiConfig) {
+        console.log('🔀 [checkApiTrigger] Found API config with prompt:', apiConfig.prompt);
+        console.log('🔀 [checkApiTrigger] Using LLM to check if query matches prompt');
+        // Use LLM to check if user query is related to the prompt
+        const chatModel = createChatModel(state.openai_api_key);
+        const checkPrompt = ChatPromptTemplate.fromMessages([
+          ['system', 'You are a routing assistant. Determine if the user query is related to the given prompt/topic. Respond with only "yes" or "no".'],
+          ['human', 'Prompt/Topic: {prompt}\n\nUser Query: {query}\n\nIs the user query related to the prompt? Respond with only "yes" or "no".']
+        ]);
+        
+        const chain = checkPrompt.pipe(chatModel);
+        const response = await chain.invoke({
+          prompt: apiConfig.prompt,
+          query: state.user_query
+        });
+        
+        const isRelated = response.content?.toLowerCase().trim().startsWith('yes');
+        console.log('🔀 [checkApiTrigger] LLM response:', response.content, '| Is related:', isRelated);
+        
+        if (isRelated) {
+          route = "api";
+          console.log('🔀 [checkApiTrigger] ✅ Routing to API path');
+        } else {
+          console.log('🔀 [checkApiTrigger] ❌ Query not related to prompt, routing to RAG path');
+        }
+      } else {
+        console.log('🔀 [checkApiTrigger] No API config (prompt + apiCurl) found in dynamic_data');
       }
+    } else {
+      console.log('🔀 [checkApiTrigger] No dynamic_data provided');
     }
     
-    console.log('🔀 Router decision: route =', route);
+    console.log('🔀 [checkApiTrigger] Final route decision:', route);
     return { route };
   } catch (error) {
     console.error('Error in checkApiTrigger:', error);
-    return { route: "rag" }; // Default to RAG on error
+    return { route: "rag" };
   }
 }
 
 // Node: Call External API
 async function callExternalApi(state) {
   try {
-    console.log('📡 Calling external API...');
-    
-    // Find API configuration from dynamic_data
+    console.log('📡 [callExternalApi] Starting external API call');
+    // Find API configuration from dynamic_data with prompt and apiCurl
     const apiConfig = state.dynamic_data.find(item => 
-      typeof item === 'object' && item !== null && (item.api_url || item.api_endpoint)
+      typeof item === 'object' && item !== null && item.prompt && item.apiCurl
     );
     
-    if (!apiConfig) {
-      throw new Error('No API configuration found in dynamic_data');
+    if (!apiConfig || !apiConfig.apiCurl) {
+      throw new Error('No API configuration (apiCurl) found in dynamic_data');
     }
     
-    const apiUrl = apiConfig.api_url || apiConfig.api_endpoint;
-    const method = apiConfig.method || 'POST';
-    const headers = apiConfig.headers || { 'Content-Type': 'application/json' };
-    const body = apiConfig.body || {
-      query: state.user_query,
-      organisation_id: state.organisation_id,
-      context: state.context,
-      chat_history: state.chat_history,
-    };
+    console.log('📡 [callExternalApi] Parsing curl command');
+    // Parse curl command
+    const curlConfig = parseCurl(apiConfig.apiCurl);
     
-    console.log('API URL:', apiUrl);
-    console.log('API Method:', method);
+    if (!curlConfig.url) {
+      throw new Error('Could not extract URL from apiCurl');
+    }
     
-    const response = await fetch(apiUrl, {
-      method: method,
-      headers: headers,
-      body: method !== 'GET' ? JSON.stringify(body) : undefined,
+    console.log('📡 [callExternalApi] API URL:', curlConfig.url);
+    console.log('📡 [callExternalApi] API Method:', curlConfig.method);
+    console.log('📡 [callExternalApi] API Headers:', JSON.stringify(curlConfig.headers));
+    
+    // Prepare request body - merge user query and context into the body
+    let requestBody = curlConfig.body || {};
+    
+    // If body is a string, try to parse it, otherwise use as template
+    if (typeof requestBody === 'string') {
+      try {
+        requestBody = JSON.parse(requestBody);
+      } catch {
+        // If not JSON, use it as template and replace placeholders
+        requestBody = {
+          query: state.user_query,
+          user_query: state.user_query,
+          organisation_id: state.organisation_id,
+          context: state.context,
+          chat_history: state.chat_history,
+        };
+      }
+    } else if (typeof requestBody === 'object') {
+      // Merge user query and context into existing body
+      requestBody = {
+        ...requestBody,
+        query: state.user_query,
+        user_query: state.user_query,
+        organisation_id: state.organisation_id,
+        context: state.context,
+        chat_history: state.chat_history,
+      };
+    } else {
+      requestBody = {
+        query: state.user_query,
+        organisation_id: state.organisation_id,
+        context: state.context,
+        chat_history: state.chat_history,
+      };
+    }
+    
+    console.log('📡 [callExternalApi] Request body:', JSON.stringify(requestBody));
+    console.log('📡 [callExternalApi] Making API request...');
+    
+    const response = await fetch(curlConfig.url, {
+      method: curlConfig.method,
+      headers: curlConfig.headers,
+      body: curlConfig.method !== 'GET' ? JSON.stringify(requestBody) : undefined,
     });
+    
+    console.log('📡 [callExternalApi] API response status:', response.status, response.statusText);
     
     if (!response.ok) {
       throw new Error(`API call failed: ${response.status} ${response.statusText}`);
     }
     
     const apiResponse = await response.json();
-    console.log('API Response:', apiResponse);
+    console.log('📡 [callExternalApi] API response received:', JSON.stringify(apiResponse).substring(0, 200) + '...');
     
-    // Extract answer from API response
-    // Support multiple response formats
-    const answer = apiResponse.answer || apiResponse.response || apiResponse.data?.answer || JSON.stringify(apiResponse);
+    // Extract answer from API response - support multiple formats
+    let answer = apiResponse.answer || apiResponse.response || apiResponse.data?.answer || apiResponse.message || apiResponse.text;
+    
+    // If no direct answer field, try to format the response
+    if (!answer) {
+      if (typeof apiResponse === 'string') {
+        answer = apiResponse;
+      } else {
+        answer = JSON.stringify(apiResponse);
+      }
+    }
+    
     const taskCreation = apiResponse.task_creation || false;
     const connectAgent = apiResponse.connect_agent || false;
     
+    console.log('📡 [callExternalApi] Extracted answer length:', answer?.length || 0);
+    console.log('📡 [callExternalApi] Task creation:', taskCreation, '| Connect agent:', connectAgent);
+    
     // Update chat history
+    console.log('📡 [callExternalApi] Updating chat history');
     const chatHistory = await getSessionChatHistory(state.organisation_id);
     await chatHistory.addMessage(new HumanMessage({ content: state.user_query, name: state.organisation_id }));
     await chatHistory.addMessage(new AIMessage({ content: answer, name: state.organisation_id }));
     
+    console.log('📡 [callExternalApi] ✅ API call completed successfully');
     return {
       answer: answer,
       task_creation: taskCreation,
@@ -514,6 +654,7 @@ async function callExternalApi(state) {
 // Node: Generate response
 async function generateResponse(state) {
   try {
+    console.log('🤖 [generateResponse] Starting RAG response generation');
     const prompt = ChatPromptTemplate.fromMessages([
       ['system', ACT_PROMPT],
       ['human', '{chat_history}\n\nContext:\n{context}\n\nQuestion:\n{question}'],
@@ -524,6 +665,7 @@ async function generateResponse(state) {
 
     const chatHistory = await getSessionChatHistory(state.organisation_id);
 
+    console.log('🤖 [generateResponse] Invoking LLM with context length:', state.context.length);
     const generation = await ragChain.invoke({
       question: state.user_query,
       context: state.context,
@@ -531,12 +673,16 @@ async function generateResponse(state) {
       agent_status: state.agents_available,
     });
 
+    console.log('🤖 [generateResponse] LLM generation received');
+    console.log('🤖 [generateResponse] Answer length:', generation.answer?.length || 0);
+    console.log('🤖 [generateResponse] Task creation:', generation.task_creation, '| Connect agent:', generation.connect_agent);
+
     // Add new messages to history
+    console.log('🤖 [generateResponse] Updating chat history');
     await chatHistory.addMessage(new HumanMessage({ content: state.user_query, name: state.organisation_id }));
     await chatHistory.addMessage(new AIMessage({ content: generation.answer, name: state.organisation_id }));
 
-    console.log('Generation:', generation);
-
+    console.log('🤖 [generateResponse] ✅ RAG response generated successfully');
     return {
       answer: generation.answer,
       task_creation: generation.task_creation,
@@ -554,7 +700,8 @@ async function generateResponse(state) {
 
 // Node: Format output
 async function formatOutput(state) {
-  return {
+  console.log('📤 [formatOutput] Formatting final output');
+  const output = {
     message: state.answer ? 'Query processed successfully' : 'Query failed, fallback response sent',
     status: state.answer ? 200 : 500,
     question: state.user_query,
@@ -562,6 +709,9 @@ async function formatOutput(state) {
     task_creation: state.task_creation,
     connect_agent: state.connect_agent,
   };
+  console.log('📤 [formatOutput] Final output status:', output.status);
+  console.log('📤 [formatOutput] Final output message:', output.message);
+  return output;
 }
 
 // Router function for conditional edges
@@ -598,8 +748,18 @@ const app = graph.compile();
 // Main function to invoke the graph
 const getResponse = async (data) => {
   try {
-    console.log('Dynamic data:', data.dynamic_data);
-
+    console.log('🚀 [getResponse] ========================================');
+    console.log('🚀 [getResponse] Starting request processing');
+    console.log('🚀 [getResponse] Organisation ID:', data.organisation_id);
+    console.log('🚀 [getResponse] User Query:', data.user_query);
+    console.log('🚀 [getResponse] FAQs count:', data.faqs?.length || 0);
+    console.log('🚀 [getResponse] Agents available:', data.agents_available);
+    console.log('🚀 [getResponse] Dynamic data items:', data.dynamic_data?.length || 0);
+    if (data.dynamic_data && data.dynamic_data.length > 0) {
+      console.log('🚀 [getResponse] Dynamic data:', JSON.stringify(data.dynamic_data).substring(0, 200) + '...');
+    }
+    console.log('🚀 [getResponse] ========================================');
+    
     const result = await app.invoke({
       organisation_id: data.organisation_id,
       user_query: data.user_query,
@@ -609,9 +769,12 @@ const getResponse = async (data) => {
       openai_api_key: data.openai_api_key || null,
       dynamic_data: data.dynamic_data || [],
     });
+    
+    console.log('🚀 [getResponse] ✅ Request processed successfully');
+    console.log('🚀 [getResponse] Final status:', result.status);
     return result;
   } catch (error) {
-    console.error('Error in getResponse:', error);
+    console.error('🚀 [getResponse] ❌ Error in getResponse:', error);
     return {
       message: 'Query failed, fallback response sent',
       status: 500,
