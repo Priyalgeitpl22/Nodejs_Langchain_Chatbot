@@ -1005,38 +1005,52 @@ async function callExternalApi(state) {
     try {
       const chatModel = createChatModel(state.openai_api_key);
       const analysisPrompt = ChatPromptTemplate.fromMessages([
-        ['system', `You are a helpful assistant. Analyze the API response data and answer the user's query based on that data. 
-        
-- If the data is an array, analyze it to answer the query appropriately
-- Provide a clear, concise, and human-readable answer
-- If the query asks about a specific person/thing, find relevant information about them
+        ['system', `You are a helpful assistant. Analyze the COMPLETE API response data and answer the user's query based on that data. 
+
+CRITICAL INSTRUCTIONS:
+- You have been provided with the COMPLETE API response data - search through ALL of it
+- If the data is an array, you must examine EVERY SINGLE ITEM in the array, not just the first few
+- If the query asks about a specific person/thing, search through ALL items in the array to find them
+- Check ALL fields in each item: firstname, lastname, email, manager_name, hr_manager_name, user.firstname, user.lastname, etc.
+- Names may appear in different formats - search for partial matches (e.g., "Isha" or "Agrawal" separately)
+- Provide a clear, concise, and human-readable answer based on what you find
+- If you find the person, describe their role, designation, status, manager, and any relevant details
 - If the query asks for a list, provide a formatted list
 - Be conversational and natural in your response
-- Only use information from the provided API data`],
+- Only use information from the provided API data
+- IMPORTANT: The data provided is COMPLETE - search through ALL of it thoroughly`],
         ['human', `User Query: {query}
 
-API Response Data:
+COMPLETE API Response Data (search through ALL items):
 {apiData}
 
-Based on the API response data above, please answer the user's query in a clear and helpful way.`]
+IMPORTANT: This is the COMPLETE API response. Search through EVERY SINGLE ITEM in the data above to answer the user's query. Do not skip any items.`]
       ]);
       
-      // Prepare API data for LLM (truncate if too large)
+      // Send the COMPLETE API response to LLM - don't truncate
+      // Modern LLMs can handle large contexts, so send everything
       let apiDataForLLM = JSON.stringify(apiResponse);
-      const maxLength = 8000; // Limit to avoid token issues
+      
+      // Only truncate if it's extremely large (over 100k chars) - but still send a large sample
+      const maxLength = 100000; // Much larger limit
       if (apiDataForLLM.length > maxLength) {
-        // If it's an array, keep first few items and summary
+        console.log('📡 [callExternalApi] Response is very large (' + apiDataForLLM.length + ' chars), but sending as much as possible');
+        // For very large arrays, send a larger sample
         if (Array.isArray(apiResponse)) {
-          const sampleSize = Math.min(10, apiResponse.length);
+          // Send first 100 items instead of just 10
+          const sampleSize = Math.min(100, apiResponse.length);
           const sample = apiResponse.slice(0, sampleSize);
           apiDataForLLM = JSON.stringify({
             total_count: apiResponse.length,
-            sample_data: sample,
-            note: `Showing ${sampleSize} of ${apiResponse.length} items`
+            items_sent: sampleSize,
+            data: sample,
+            note: `Sending ${sampleSize} of ${apiResponse.length} items. Please search through ALL items provided.`
           });
         } else {
-          apiDataForLLM = apiDataForLLM.substring(0, maxLength) + '... (truncated)';
+          apiDataForLLM = apiDataForLLM.substring(0, maxLength);
         }
+      } else {
+        console.log('📡 [callExternalApi] Sending complete API response to LLM (' + apiDataForLLM.length + ' characters)');
       }
       
       const analysisChain = analysisPrompt.pipe(chatModel);
