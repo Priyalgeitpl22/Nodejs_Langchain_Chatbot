@@ -843,8 +843,20 @@ async function checkApiTrigger(state) {
         // Use LLM to check if user query is related to the prompt
         const chatModel = createChatModel(state.openai_api_key);
         const checkPrompt = ChatPromptTemplate.fromMessages([
-          ['system', 'You are a routing assistant. Determine if the user query is related to the given prompt/topic. Respond with only "yes" or "no".'],
-          ['human', 'Prompt/Topic: {prompt}\n\nUser Query: {query}\n\nIs the user query related to the prompt? Respond with only "yes" or "no".']
+          ['system', `You are a routing assistant. Determine if the user query is related to the given prompt/topic.
+
+IMPORTANT: Be LENIENT. If the query is asking about the same general topic/domain as the prompt, respond "yes".
+
+Examples:
+- Prompt: "user information", Query: "get users" → YES
+- Prompt: "user information", Query: "tell me the age of Michael Williams from users list" → YES (asking about a user)
+- Prompt: "user information", Query: "list all users" → YES
+- Prompt: "employee information", Query: "who is John in the company" → YES (asking about an employee)
+- Prompt: "user information", Query: "what is the weather today" → NO (completely different topic)
+
+If the query is about the same domain/topic as the prompt, even if worded differently, respond "yes".
+Respond with only "yes" or "no".`],
+          ['human', 'Prompt/Topic: {prompt}\n\nUser Query: {query}\n\nIs the user query related to the prompt? Be lenient - if it\'s about the same topic/domain, say yes. Respond with only "yes" or "no".']
         ]);
         
         const chain = checkPrompt.pipe(chatModel);
