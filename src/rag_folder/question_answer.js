@@ -479,6 +479,7 @@ const getResponse = async (data) => {
       agents_available: data.agents_available || false,
       available_agents: data.available_agents || [],
       openai_api_key: data.openai_api_key || null,
+      dynamic_data: data.dynamic_data || [],
     });
     return result;
   } catch (error) {
