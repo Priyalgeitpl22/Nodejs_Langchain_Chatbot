@@ -845,19 +845,23 @@ async function checkApiTrigger(state) {
         const checkPrompt = ChatPromptTemplate.fromMessages([
           ['system', `You are a routing assistant. Determine if the user query is related to the given prompt/topic.
 
-Be LENIENT and GENERAL. If the query is asking about the same general topic/domain as the prompt, respond "yes".
+IMPORTANT RULES:
+1. If the prompt is about a GENERAL topic (e.g., "user information", "employee data"), queries about that topic should match - YES
+2. If the prompt mentions a SPECIFIC person by name (e.g., "information about John Doe", "details about priyal garg"), the query must be about THAT SAME person to match - YES
+3. If the prompt is about a specific person, but the query asks about a DIFFERENT person, respond NO - even if both are about people/employees
 
 Examples:
-- Prompt: "user information", Query: "get users" → YES
-- Prompt: "user information", Query: "tell me the age of Michael Williams from users list" → YES
-- Prompt: "user information", Query: "list all users" → YES
-- Prompt: "employee information", Query: "who is John in the company" → YES
-- Prompt: "employee information", Query: "list employees" → YES
-- Prompt: "user information", Query: "what is the weather today" → NO
+- Prompt: "user information", Query: "get users" → YES (general topic)
+- Prompt: "user information", Query: "tell me the age of Michael Williams from users list" → YES (general topic about users)
+- Prompt: "user information", Query: "list all users" → YES (general topic)
+- Prompt: "employee information", Query: "who is John in the company" → YES (general topic)
+- Prompt: "This is information about priyal garg", Query: "tell me about priyal garg" → YES (same person)
+- Prompt: "This is information about priyal garg", Query: "tell me the age of Michael Williams" → NO (different person)
+- Prompt: "This is the whole information about priyal garg", Query: "tell me the age of Michael Williams from users list" → NO (different person, even though query mentions users)
+- Prompt: "user information", Query: "what is the weather today" → NO (completely different topic)
 
-If the query is about the same domain/topic as the prompt, respond "yes".
 Respond with only "yes" or "no".`],
-          ['human', 'Prompt/Topic: {prompt}\n\nUser Query: {query}\n\nIs the user query related to the prompt? Be lenient - if it\'s about the same general topic/domain, say yes. Respond with only "yes" or "no".']
+          ['human', 'Prompt/Topic: {prompt}\n\nUser Query: {query}\n\nIs the user query related to the prompt? If the prompt mentions a specific person, the query must be about that same person. If the prompt is about a general topic, queries about that topic should match. Respond with only "yes" or "no".']
         ]);
         
         const chain = checkPrompt.pipe(chatModel);
