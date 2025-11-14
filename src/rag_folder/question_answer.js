@@ -325,9 +325,9 @@ async function retrieveDocuments(state) {
     console.log('🔍 [retrieveDocuments] Starting document retrieval for query:', state.user_query);
     let documents = [];
     
-    // Skip document retrieval if dynamic_data has prompt and apiCurl (will use API route)
+    // Skip document retrieval if dynamic_data has prompt and apiCurl/apiUrl (will use API route)
     const hasApiConfig = state.dynamic_data && state.dynamic_data.some(item => 
-      typeof item === 'object' && item !== null && (item.prompt && item.apiCurl)
+      typeof item === 'object' && item !== null && (item.prompt && (item.apiCurl || item.apiUrl))
     );
     
     if (hasApiConfig) {
@@ -381,7 +381,8 @@ async function createContext(state) {
     ? '\n\nRelevant FAQs:\n' + state.faqs.map(faq => `Q: ${faq.question}\nA: ${faq.answer}`).join('\n\n')
     : '';
 
-  let agentInfo;
+  let agentInfo = '';
+  // Only include agent information if agents are actually available
   if (state.agents_available && state.available_agents.length > 0) {
     const agentNames = state.available_agents.map(agent => {
       if (typeof agent === 'string') return agent;
@@ -391,9 +392,8 @@ async function createContext(state) {
       return 'Unknown Agent';
     });
     agentInfo = `\n\nAgent Information: ${state.available_agents.length} agent(s) available: ${agentNames.join(', ')}`;
-  } else {
-    agentInfo = '\n\nAgent Information: No agents currently available';
   }
+  // If no agents available, don't add any agent info to context
 
   const fullContext = documentContext + faqContext + agentInfo;
   console.log('📝 [createContext] Context created, length:', fullContext.length, 'characters');
@@ -831,13 +831,14 @@ async function checkApiTrigger(state) {
     
     if (state.dynamic_data && state.dynamic_data.length > 0) {
       console.log('🔀 [checkApiTrigger] Checking dynamic_data for API config, items:', state.dynamic_data.length);
-      // Find item with prompt and apiCurl
+      // Find item with prompt and either apiCurl or apiUrl
       const apiConfig = state.dynamic_data.find(item => 
-        typeof item === 'object' && item !== null && item.prompt && item.apiCurl
+        typeof item === 'object' && item !== null && item.prompt && (item.apiCurl || item.apiUrl)
       );
       
       if (apiConfig) {
         console.log('🔀 [checkApiTrigger] Found API config with prompt:', apiConfig.prompt);
+        console.log('🔀 [checkApiTrigger] API type:', apiConfig.apiCurl ? 'curl' : 'simple URL');
         console.log('🔀 [checkApiTrigger] Using LLM to check if query matches prompt');
         // Use LLM to check if user query is related to the prompt
         const chatModel = createChatModel(state.openai_api_key);
@@ -862,7 +863,7 @@ async function checkApiTrigger(state) {
           console.log('🔀 [checkApiTrigger] ❌ Query not related to prompt, routing to RAG path');
         }
       } else {
-        console.log('🔀 [checkApiTrigger] No API config (prompt + apiCurl) found in dynamic_data');
+        console.log('🔀 [checkApiTrigger] No API config (prompt + apiCurl/apiUrl) found in dynamic_data');
       }
     } else {
       console.log('🔀 [checkApiTrigger] No dynamic_data provided');
@@ -880,29 +881,100 @@ async function checkApiTrigger(state) {
 async function callExternalApi(state) {
   try {
     console.log('📡 [callExternalApi] Starting external API call');
-    // Find API configuration from dynamic_data with prompt and apiCurl
+    // Find API configuration from dynamic_data with prompt and either apiCurl or apiUrl
     const apiConfig = state.dynamic_data.find(item => 
-      typeof item === 'object' && item !== null && item.prompt && item.apiCurl
+      typeof item === 'object' && item !== null && item.prompt && (item.apiCurl || item.apiUrl)
     );
     
-    if (!apiConfig || !apiConfig.apiCurl) {
-      throw new Error('No API configuration (apiCurl) found in dynamic_data');
+    if (!apiConfig) {
+      throw new Error('No API configuration (apiCurl or apiUrl) found in dynamic_data');
     }
     
-    console.log('📡 [callExternalApi] Parsing curl command');
-    // Parse curl command
-    const curlConfig = parseCurl(apiConfig.apiCurl);
+    let apiUrl, apiMethod, apiHeaders, requestBody = null;
     
-    if (!curlConfig.url) {
-      throw new Error('Could not extract URL from apiCurl');
+    // Handle simple URL (apiUrl)
+    if (apiConfig.apiUrl) {
+      console.log('📡 [callExternalApi] Using simple URL:', apiConfig.apiUrl);
+      apiUrl = apiConfig.apiUrl;
+      apiMethod = apiConfig.method || 'GET';
+      apiHeaders = apiConfig.headers || { 'Accept': 'application/json' };
+      
+      // For POST/PUT/PATCH with simple URL, prepare body
+      const methodsWithBody = ['POST', 'PUT', 'PATCH'];
+      if (methodsWithBody.includes(apiMethod)) {
+        requestBody = apiConfig.body || {
+          query: state.user_query,
+          user_query: state.user_query,
+          organisation_id: state.organisation_id,
+          context: state.context,
+          chat_history: state.chat_history,
+        };
+      }
+    } 
+    // Handle curl command (apiCurl)
+    else if (apiConfig.apiCurl) {
+      console.log('📡 [callExternalApi] Parsing curl command');
+      const curlConfig = parseCurl(apiConfig.apiCurl);
+      
+      if (!curlConfig.url) {
+        throw new Error('Could not extract URL from apiCurl');
+      }
+      
+      apiUrl = curlConfig.url;
+      apiMethod = curlConfig.method;
+      apiHeaders = curlConfig.headers;
+      
+      // Prepare request - only add body for POST, PUT, PATCH methods
+      const methodsWithBody = ['POST', 'PUT', 'PATCH'];
+      
+      if (methodsWithBody.includes(apiMethod)) {
+        requestBody = curlConfig.body || {};
+        
+        // If body is a string, try to parse it, otherwise use as template
+        if (typeof requestBody === 'string') {
+          try {
+            requestBody = JSON.parse(requestBody);
+          } catch {
+            requestBody = {
+              query: state.user_query,
+              user_query: state.user_query,
+              organisation_id: state.organisation_id,
+              context: state.context,
+              chat_history: state.chat_history,
+            };
+          }
+        } else if (typeof requestBody === 'object') {
+          // Merge user query and context into existing body
+          requestBody = {
+            ...requestBody,
+            query: state.user_query,
+            user_query: state.user_query,
+            organisation_id: state.organisation_id,
+            context: state.context,
+            chat_history: state.chat_history,
+          };
+        } else {
+          requestBody = {
+            query: state.user_query,
+            organisation_id: state.organisation_id,
+            context: state.context,
+            chat_history: state.chat_history,
+          };
+        }
+        console.log('📡 [callExternalApi] Request body:', JSON.stringify(requestBody));
+      } else {
+        console.log('📡 [callExternalApi] GET request - no body will be sent');
+      }
+    } else {
+      throw new Error('No API configuration (apiCurl or apiUrl) found in dynamic_data');
     }
     
-    console.log('📡 [callExternalApi] API URL:', curlConfig.url);
-    console.log('📡 [callExternalApi] API Method:', curlConfig.method);
-    console.log('📡 [callExternalApi] API Headers count:', Object.keys(curlConfig.headers).length);
+    console.log('📡 [callExternalApi] API URL:', apiUrl);
+    console.log('📡 [callExternalApi] API Method:', apiMethod);
+    console.log('📡 [callExternalApi] API Headers count:', Object.keys(apiHeaders).length);
     // Log headers but mask sensitive tokens
     const headersForLog = {};
-    for (const [key, value] of Object.entries(curlConfig.headers)) {
+    for (const [key, value] of Object.entries(apiHeaders)) {
       if (key.toLowerCase() === 'authorization' || key.toLowerCase().includes('token')) {
         headersForLog[key] = value.substring(0, 20) + '...' + value.substring(value.length - 10);
       } else {
@@ -912,61 +984,17 @@ async function callExternalApi(state) {
     console.log('📡 [callExternalApi] API Headers:', JSON.stringify(headersForLog));
     
     // Verify authorization header is present
-    if (curlConfig.headers['authorization'] || curlConfig.headers['Authorization']) {
+    if (apiHeaders['authorization'] || apiHeaders['Authorization']) {
       console.log('📡 [callExternalApi] ✅ Authorization token found in headers');
     } else {
       console.log('📡 [callExternalApi] ⚠️ No authorization header found');
     }
     
-    // Prepare request - only add body for POST, PUT, PATCH methods
-    let requestBody = null;
-    const methodsWithBody = ['POST', 'PUT', 'PATCH'];
-    
-    if (methodsWithBody.includes(curlConfig.method)) {
-      requestBody = curlConfig.body || {};
-      
-      // If body is a string, try to parse it, otherwise use as template
-      if (typeof requestBody === 'string') {
-        try {
-          requestBody = JSON.parse(requestBody);
-        } catch {
-          // If not JSON, use it as template and replace placeholders
-          requestBody = {
-            query: state.user_query,
-            user_query: state.user_query,
-            organisation_id: state.organisation_id,
-            context: state.context,
-            chat_history: state.chat_history,
-          };
-        }
-      } else if (typeof requestBody === 'object') {
-        // Merge user query and context into existing body
-        requestBody = {
-          ...requestBody,
-          query: state.user_query,
-          user_query: state.user_query,
-          organisation_id: state.organisation_id,
-          context: state.context,
-          chat_history: state.chat_history,
-        };
-      } else {
-        requestBody = {
-          query: state.user_query,
-          organisation_id: state.organisation_id,
-          context: state.context,
-          chat_history: state.chat_history,
-        };
-      }
-      console.log('📡 [callExternalApi] Request body:', JSON.stringify(requestBody));
-    } else {
-      console.log('📡 [callExternalApi] GET request - no body will be sent');
-    }
-    
     console.log('📡 [callExternalApi] Making API request...');
     
-    const response = await fetch(curlConfig.url, {
-      method: curlConfig.method,
-      headers: curlConfig.headers,
+    const response = await fetch(apiUrl, {
+      method: apiMethod,
+      headers: apiHeaders,
       body: requestBody ? JSON.stringify(requestBody) : undefined,
     });
     
