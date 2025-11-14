@@ -400,6 +400,334 @@ async function createContext(state) {
   return { context: fullContext };
 }
 
+// Helper function to analyze data structure and extract key information
+function analyzeDataStructure(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return { fields: [], hasNestedObjects: false };
+  }
+
+  // Sample first few items to understand structure
+  const sampleSize = Math.min(3, items.length);
+  const samples = items.slice(0, sampleSize);
+  
+  // Collect all unique keys from all items
+  const allKeys = new Set();
+  let hasNestedObjects = false;
+  
+  samples.forEach(item => {
+    if (typeof item === 'object' && item !== null) {
+      Object.keys(item).forEach(key => {
+        allKeys.add(key);
+        // Check if value is an object (nested)
+        if (item[key] && typeof item[key] === 'object' && !Array.isArray(item[key])) {
+          hasNestedObjects = true;
+        }
+      });
+    }
+  });
+
+  // Prioritize common identifier fields
+  const priorityFields = ['name', 'title', 'firstname', 'lastname', 'email', 'id', 'emp_id', 'user_id'];
+  const commonFields = ['status', 'type', 'category', 'role', 'designation', 'manager', 'description'];
+  
+  // Find the best identifier field
+  let identifierField = null;
+  for (const field of priorityFields) {
+    if (allKeys.has(field)) {
+      identifierField = field;
+      break;
+    }
+  }
+  
+  // Collect other relevant fields (excluding nested objects and arrays)
+  const relevantFields = [];
+  allKeys.forEach(key => {
+    if (key !== identifierField) {
+      const sampleValue = samples[0]?.[key];
+      // Include if it's a simple value (not object/array) or if it's a common field
+      if (sampleValue !== null && sampleValue !== undefined) {
+        if (typeof sampleValue !== 'object' || commonFields.includes(key)) {
+          relevantFields.push(key);
+        }
+      }
+    }
+  });
+
+  return {
+    identifierField,
+    relevantFields: relevantFields.slice(0, 5), // Limit to 5 most relevant fields
+    hasNestedObjects,
+    allKeys: Array.from(allKeys)
+  };
+}
+
+// Helper function to format a single item based on its structure
+function formatItem(item, index, structure) {
+  if (typeof item !== 'object' || item === null) {
+    return `${index + 1}. ${item}`;
+  }
+
+  let formatted = `${index + 1}. `;
+  
+  // Get identifier value
+  let identifier = '';
+  if (structure.identifierField) {
+    const fieldValue = item[structure.identifierField];
+    if (fieldValue) {
+      if (typeof fieldValue === 'object' && fieldValue.name) {
+        identifier = fieldValue.name;
+      } else {
+        identifier = String(fieldValue);
+      }
+    }
+  }
+  
+  // If no identifier found, try to construct one from common fields
+  if (!identifier) {
+    if (item.firstname && item.lastname) {
+      identifier = `${item.firstname} ${item.lastname}`.trim();
+    } else if (item.name) {
+      identifier = item.name;
+    } else if (item.title) {
+      identifier = item.title;
+    } else if (item.email) {
+      identifier = item.email;
+    } else if (item.id) {
+      identifier = `Item ${item.id}`;
+    } else {
+      identifier = `Item ${index + 1}`;
+    }
+  }
+  
+  formatted += identifier;
+  
+  // Add relevant fields
+  structure.relevantFields.forEach(field => {
+    const value = item[field];
+    if (value !== null && value !== undefined && value !== '') {
+      let displayValue = value;
+      
+      // Handle nested objects (like designation.name)
+      if (typeof value === 'object' && !Array.isArray(value)) {
+        if (value.name) {
+          displayValue = value.name;
+        } else if (value.title) {
+          displayValue = value.title;
+        } else {
+          displayValue = JSON.stringify(value).substring(0, 30);
+        }
+      }
+      // Handle arrays
+      else if (Array.isArray(value)) {
+        displayValue = `${value.length} item(s)`;
+      }
+      // Handle long strings
+      else if (typeof value === 'string' && value.length > 50) {
+        displayValue = value.substring(0, 50) + '...';
+      }
+      
+      formatted += ` - ${field}: ${displayValue}`;
+    }
+  });
+  
+  return formatted;
+}
+
+// Helper function to format object response in human-readable format
+function formatObjectResponse(obj) {
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+    return String(obj);
+  }
+
+  let response = '';
+  const keys = Object.keys(obj);
+  
+  if (keys.length === 0) {
+    return 'No information available.';
+  }
+
+  // If it's a simple object with just a few fields, format it naturally
+  if (keys.length <= 5) {
+    const parts = [];
+    keys.forEach(key => {
+      let value = obj[key];
+      
+      // Format the value appropriately
+      if (value === null || value === undefined) {
+        return; // Skip null/undefined
+      } else if (typeof value === 'object' && !Array.isArray(value)) {
+        if (value.name) {
+          value = value.name;
+        } else if (value.title) {
+          value = value.title;
+        } else {
+          value = JSON.stringify(value).substring(0, 50);
+        }
+      } else if (Array.isArray(value)) {
+        value = `${value.length} item(s)`;
+      } else if (typeof value === 'string' && value.length > 100) {
+        value = value.substring(0, 100) + '...';
+      }
+      
+      const fieldLabel = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+      parts.push(`${fieldLabel}: ${value}`);
+    });
+    
+    if (parts.length > 0) {
+      response = parts.join('. ') + '.';
+    }
+  } else {
+    // For complex objects, show key information
+    const importantFields = ['name', 'title', 'id', 'status', 'message', 'description', 'result'];
+    let foundImportant = false;
+    
+    importantFields.forEach(field => {
+      if (obj[field] !== undefined && obj[field] !== null) {
+        if (!foundImportant) {
+          response = `Here's what I found:\n\n`;
+          foundImportant = true;
+        }
+        const fieldLabel = field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+        let value = obj[field];
+        if (typeof value === 'object' && value.name) {
+          value = value.name;
+        }
+        response += `${fieldLabel}: ${value}\n`;
+      }
+    });
+    
+    if (!foundImportant) {
+      response = 'I received the information successfully.';
+    }
+  }
+
+  return response || 'Information retrieved successfully.';
+}
+
+// Helper function to format array response as a readable list
+function formatArrayResponse(dataArray) {
+  if (!Array.isArray(dataArray) || dataArray.length === 0) {
+    return 'I couldn\'t find any results for your query.';
+  }
+
+  const count = dataArray.length;
+  
+  // Analyze the data structure
+  const structure = analyzeDataStructure(dataArray);
+  console.log('📋 [formatArrayResponse] Data structure analysis:', {
+    identifierField: structure.identifierField,
+    relevantFields: structure.relevantFields,
+    totalItems: count
+  });
+
+  // Create a more human-readable response
+  let response = '';
+  
+  // Start with a natural introduction
+  if (count === 1) {
+    response = 'I found 1 result:\n\n';
+  } else {
+    response = `I found ${count} results. Here they are:\n\n`;
+  }
+
+  // Format each item in a conversational way
+  dataArray.forEach((item, index) => {
+    if (typeof item !== 'object' || item === null) {
+      response += `${index + 1}. ${item}\n`;
+      return;
+    }
+
+    // Get the main identifier
+    let mainIdentifier = '';
+    if (structure.identifierField) {
+      const fieldValue = item[structure.identifierField];
+      if (fieldValue) {
+        if (typeof fieldValue === 'object' && fieldValue.name) {
+          mainIdentifier = fieldValue.name;
+        } else {
+          mainIdentifier = String(fieldValue);
+        }
+      }
+    }
+    
+    // Fallback identifier construction
+    if (!mainIdentifier) {
+      if (item.firstname && item.lastname) {
+        mainIdentifier = `${item.firstname} ${item.lastname}`.trim();
+      } else if (item.name) {
+        mainIdentifier = item.name;
+      } else if (item.title) {
+        mainIdentifier = item.title;
+      } else if (item.email) {
+        mainIdentifier = item.email;
+      } else if (item.id) {
+        mainIdentifier = `Item #${item.id}`;
+      } else {
+        mainIdentifier = `Result ${index + 1}`;
+      }
+    }
+
+    // Build a natural sentence for each item
+    let itemText = `${index + 1}. ${mainIdentifier}`;
+    const details = [];
+
+    // Add relevant details in a natural way
+    structure.relevantFields.forEach(field => {
+      const value = item[field];
+      if (value !== null && value !== undefined && value !== '') {
+        let displayValue = value;
+        
+        // Handle nested objects
+        if (typeof value === 'object' && !Array.isArray(value)) {
+          if (value.name) {
+            displayValue = value.name;
+          } else if (value.title) {
+            displayValue = value.title;
+          } else {
+            return; // Skip complex nested objects
+          }
+        }
+        // Handle arrays
+        else if (Array.isArray(value)) {
+          if (value.length > 0) {
+            displayValue = `${value.length} item(s)`;
+          } else {
+            return; // Skip empty arrays
+          }
+        }
+        // Handle long strings
+        else if (typeof value === 'string' && value.length > 50) {
+          displayValue = value.substring(0, 50) + '...';
+        }
+        
+        // Format field name in a human-readable way
+        const fieldLabel = field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+        details.push(`${fieldLabel}: ${displayValue}`);
+      }
+    });
+
+    // Combine details naturally
+    if (details.length > 0) {
+      if (details.length === 1) {
+        itemText += ` (${details[0]})`;
+      } else if (details.length <= 3) {
+        itemText += ` - ${details.join(', ')}`;
+      } else {
+        itemText += ` - ${details.slice(0, 3).join(', ')} and ${details.length - 3} more`;
+      }
+    }
+
+    response += itemText + '\n';
+  });
+
+  // Add a friendly closing if there are many results
+  if (count > 10) {
+    response += `\nThese are all ${count} results I found.`;
+  }
+
+  return response.trim();
+}
+
 // Helper function to parse curl command
 function parseCurl(curlString) {
   const result = {
@@ -673,16 +1001,31 @@ async function callExternalApi(state) {
     // Extract answer from API response - support multiple formats
     let answer = apiResponse.answer || apiResponse.response || apiResponse.data?.answer || apiResponse.message || apiResponse.text;
     
-    // If no direct answer field, try to format the response
+    // If no direct answer field, format the response appropriately
     if (!answer) {
       if (typeof apiResponse === 'string') {
         answer = apiResponse;
       } else if (Array.isArray(apiResponse)) {
-        // If response is an array, format it nicely
-        answer = `I found ${apiResponse.length} result(s). ${JSON.stringify(apiResponse).substring(0, 500)}`;
+        // If response is an array, format it as a nice list
+        console.log('📡 [callExternalApi] Formatting array response with', apiResponse.length, 'items');
+        answer = formatArrayResponse(apiResponse);
+      } else if (apiResponse.data && Array.isArray(apiResponse.data)) {
+        // If response has a data field that's an array
+        console.log('📡 [callExternalApi] Formatting array response from data field with', apiResponse.data.length, 'items');
+        answer = formatArrayResponse(apiResponse.data);
+      } else if (apiResponse.results && Array.isArray(apiResponse.results)) {
+        // If response has a results field that's an array
+        console.log('📡 [callExternalApi] Formatting array response from results field with', apiResponse.results.length, 'items');
+        answer = formatArrayResponse(apiResponse.results);
       } else {
-        answer = JSON.stringify(apiResponse);
+        // For other object responses, format in human-readable way
+        console.log('📡 [callExternalApi] Formatting object response');
+        answer = formatObjectResponse(apiResponse);
       }
+    } else if (Array.isArray(answer)) {
+      // If answer field itself is an array
+      console.log('📡 [callExternalApi] Formatting array answer with', answer.length, 'items');
+      answer = formatArrayResponse(answer);
     }
     
     // Validate that we got a meaningful answer
