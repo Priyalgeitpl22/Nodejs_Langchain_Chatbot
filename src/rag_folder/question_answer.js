@@ -240,6 +240,7 @@ const ChatBotState = {
   task_creation: false,
   connect_agent: false,
   openai_api_key: null,
+  route: null, // "api" or "rag"
 };
 
 
@@ -277,7 +278,7 @@ const createEmbeddingModel = (apiKey) => {
 async function initializeChatHistory(state) {
   try {
     const historyDb = await connectHistoryDb();
-    const chatHistory = await getSessionChatHistory(historyDb, state.organisation_id);
+    const chatHistory = await getSessionChatHistory(state.organisation_id);
     const organisationId = state.organisation_id.replace(/-/g, '').padEnd(32, '0');
 
     if (!(await checkOrganisationInSession(historyDb, state.organisation_id))) {
@@ -323,25 +324,38 @@ async function initializeChatHistory(state) {
   }
 }
 
-// Node: Retrieve documents
+// Node: Retrieve documents (using dynamic_data)
 async function retrieveDocuments(state) {
   try {
-    const collectionName = `org-${state.organisation_id}`;
-    const embeddingModel = createEmbeddingModel(state.openai_api_key);
-    const vectorStore = await getOrCreateCollection(collectionName, embeddingModel);
-    const retriever = vectorStore.asRetriever({
-      searchType: 'mmr',
-      search_kwargs: {
-        filter: { organisation_id: state.organisation_id },
-        k: 4,
-      },
-    });
+    // Use dynamic_data if available, otherwise use vector store
+    let documents = [];
+    
+    if (state.dynamic_data && state.dynamic_data.length > 0) {
+      console.log('Using dynamic_data for document retrieval:', state.dynamic_data);
+      // Convert dynamic_data to document format if needed
+      documents = state.dynamic_data.map(item => ({
+        pageContent: typeof item === 'string' ? item : JSON.stringify(item),
+        metadata: {}
+      }));
+    } else {
+      // Fallback to vector store retrieval
+      const collectionName = `org-${state.organisation_id}`;
+      const embeddingModel = createEmbeddingModel(state.openai_api_key);
+      const vectorStore = await getOrCreateCollection(collectionName, embeddingModel);
+      const retriever = vectorStore.asRetriever({
+        searchType: 'mmr',
+        search_kwargs: {
+          filter: { organisation_id: state.organisation_id },
+          k: 4,
+        },
+      });
 
-    console.log('Retriever:', retriever);
-    console.log('Query:', state.user_query);
-    const documents = await retriever.getRelevantDocuments(state.user_query);
+      console.log('Retriever:', retriever);
+      console.log('Query:', state.user_query);
+      documents = await retriever.getRelevantDocuments(state.user_query);
+    }
+    
     console.log('Retrieved Documents:', documents);
-
     return { documents };
   } catch (error) {
     console.error('Error in retrieveDocuments:', error);
@@ -394,6 +408,109 @@ async function createContext(state) {
   return { context: fullContext };
 }
 
+// Node: Check API Trigger (MODEL ROUTER)
+async function checkApiTrigger(state) {
+  try {
+    // Determine route based on dynamic_data or other conditions
+    // If dynamic_data contains API configuration, route to "api"
+    // Otherwise, route to "rag"
+    let route = "rag"; // default route
+    
+    if (state.dynamic_data && state.dynamic_data.length > 0) {
+      // Check if dynamic_data contains API configuration
+      const hasApiConfig = state.dynamic_data.some(item => {
+        if (typeof item === 'object' && item !== null) {
+          return item.api_url || item.api_endpoint || item.route === 'api';
+        }
+        return false;
+      });
+      
+      // Check if dynamic_data explicitly specifies route
+      const explicitRoute = state.dynamic_data.find(item => 
+        typeof item === 'object' && item !== null && (item.route === 'api' || item.route === 'rag')
+      );
+      
+      if (explicitRoute) {
+        route = explicitRoute.route;
+      } else if (hasApiConfig) {
+        route = "api";
+      }
+    }
+    
+    console.log('🔀 Router decision: route =', route);
+    return { route };
+  } catch (error) {
+    console.error('Error in checkApiTrigger:', error);
+    return { route: "rag" }; // Default to RAG on error
+  }
+}
+
+// Node: Call External API
+async function callExternalApi(state) {
+  try {
+    console.log('📡 Calling external API...');
+    
+    // Find API configuration from dynamic_data
+    const apiConfig = state.dynamic_data.find(item => 
+      typeof item === 'object' && item !== null && (item.api_url || item.api_endpoint)
+    );
+    
+    if (!apiConfig) {
+      throw new Error('No API configuration found in dynamic_data');
+    }
+    
+    const apiUrl = apiConfig.api_url || apiConfig.api_endpoint;
+    const method = apiConfig.method || 'POST';
+    const headers = apiConfig.headers || { 'Content-Type': 'application/json' };
+    const body = apiConfig.body || {
+      query: state.user_query,
+      organisation_id: state.organisation_id,
+      context: state.context,
+      chat_history: state.chat_history,
+    };
+    
+    console.log('API URL:', apiUrl);
+    console.log('API Method:', method);
+    
+    const response = await fetch(apiUrl, {
+      method: method,
+      headers: headers,
+      body: method !== 'GET' ? JSON.stringify(body) : undefined,
+    });
+    
+    if (!response.ok) {
+      throw new Error(`API call failed: ${response.status} ${response.statusText}`);
+    }
+    
+    const apiResponse = await response.json();
+    console.log('API Response:', apiResponse);
+    
+    // Extract answer from API response
+    // Support multiple response formats
+    const answer = apiResponse.answer || apiResponse.response || apiResponse.data?.answer || JSON.stringify(apiResponse);
+    const taskCreation = apiResponse.task_creation || false;
+    const connectAgent = apiResponse.connect_agent || false;
+    
+    // Update chat history
+    const chatHistory = await getSessionChatHistory(state.organisation_id);
+    await chatHistory.addMessage(new HumanMessage({ content: state.user_query, name: state.organisation_id }));
+    await chatHistory.addMessage(new AIMessage({ content: answer, name: state.organisation_id }));
+    
+    return {
+      answer: answer,
+      task_creation: taskCreation,
+      connect_agent: connectAgent,
+    };
+  } catch (error) {
+    console.error('Error in callExternalApi:', error);
+    return {
+      answer: `Sorry, I encountered an error calling the external API: ${error.message}`,
+      task_creation: false,
+      connect_agent: false,
+    };
+  }
+}
+
 // Node: Generate response
 async function generateResponse(state) {
   try {
@@ -405,8 +522,7 @@ async function generateResponse(state) {
     const chatModel = createChatModel(state.openai_api_key);
     const ragChain = prompt.pipe(chatModel).pipe(new JsonOutputParser());
 
-    const historyDb = await connectHistoryDb();
-    const chatHistory = await getSessionChatHistory(historyDb, state.organisation_id);
+    const chatHistory = await getSessionChatHistory(state.organisation_id);
 
     const generation = await ragChain.invoke({
       question: state.user_query,
@@ -448,19 +564,31 @@ async function formatOutput(state) {
   };
 }
 
+// Router function for conditional edges
+function routeDecision(state) {
+  return state.route || "rag";
+}
+
 // Create the graph
 const graph = new StateGraph({ channels: ChatBotState })
   .addNode("initializeChatHistory", initializeChatHistory)
   .addNode("retrieveDocuments", retrieveDocuments)
   .addNode("filterFAQs", filterFAQs)
   .addNode("createContext", createContext)
+  .addNode("checkApiTrigger", checkApiTrigger)
+  .addNode("callExternalApi", callExternalApi)
   .addNode("generateResponse", generateResponse)
   .addNode("formatOutput", formatOutput)
   .addEdge(START, "initializeChatHistory")
   .addEdge("initializeChatHistory", "retrieveDocuments")
   .addEdge("retrieveDocuments", "filterFAQs")
   .addEdge("filterFAQs", "createContext")
-  .addEdge("createContext", "generateResponse")
+  .addEdge("createContext", "checkApiTrigger")
+  .addConditionalEdges("checkApiTrigger", routeDecision, {
+    "api": "callExternalApi",
+    "rag": "generateResponse"
+  })
+  .addEdge("callExternalApi", "formatOutput")
   .addEdge("generateResponse", "formatOutput")
   .addEdge("formatOutput", END);
 
