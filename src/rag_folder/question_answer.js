@@ -216,6 +216,7 @@ import { checkOrganisationInSession, connectToDatabase as connectHistoryDb } fro
 import { OpenAIEmbeddings } from '@langchain/openai';
 import { getOrCreateCollection } from '../database/organisation_vector_database.js';
 import { ACT_PROMPT } from '../organisation_prompts/prompts.js';
+import { extractToolConfiguration, saveToolConfiguration } from '../utils/toolConfiguration.js';
 
 dotenv.config();
 
@@ -238,15 +239,24 @@ const ChatBotState = {
   answer: null,
   tool_calls:[],
   task_creation: false,
+  tool_configuration: false,
+  tool_config_data: null,
   connect_agent: false,
   openai_api_key: null,
-  route: null, // "api" or "rag"
+  user_id: null,
+  backend_api_url: null,
+  auth_token: null,
 };
 
 
-// Function to get the appropriate API key
+// Function to get the appropriate API key with logging
 const getApiKey = (dynamicKey) => {
-  return dynamicKey || OPENAI_API_KEY;
+  const apiKey = dynamicKey || OPENAI_API_KEY;
+  const keySource = dynamicKey ? 'dynamic (from request)' : 'default (from environment)';
+  const maskedKey = apiKey ? `${apiKey.substring(0, 8)}...${apiKey.substring(apiKey.length - 4)}` : 'undefined';
+  
+  console.log(`🔑 Using OpenAI API key: ${maskedKey} (${keySource})`);
+  return apiKey;
 };
 
 // Function to create chat model with dynamic API key
@@ -272,18 +282,16 @@ const createEmbeddingModel = (apiKey) => {
 // Node: Initialize chat history
 async function initializeChatHistory(state) {
   try {
-    console.log('📚 [initializeChatHistory] Starting chat history initialization for org:', state.organisation_id);
     const historyDb = await connectHistoryDb();
-    const chatHistory = await getSessionChatHistory(state.organisation_id);
+    const chatHistory = await getSessionChatHistory(historyDb, state.organisation_id);
+    const organisationId = state.organisation_id.replace(/-/g, '').padEnd(32, '0');
 
     if (!(await checkOrganisationInSession(historyDb, state.organisation_id))) {
-      console.log('📚 [initializeChatHistory] New session detected, initializing with organisation_data');
       await chatHistory.addMessage(new HumanMessage({ name: state.organisation_id, content: 'organisation_data' }));
       await chatHistory.addMessage(new AIMessage({ name: state.organisation_id, content: 'organisation_data' }));
     }
 
     const historyMessages = await chatHistory.getMessages();
-    console.log('📚 [initializeChatHistory] Loaded', historyMessages.length, 'messages from history');
     const messages = historyMessages.map(msg => {
       if (msg && typeof msg === 'object' && msg.kwargs && msg.kwargs.content) {
         try {
@@ -306,9 +314,11 @@ async function initializeChatHistory(state) {
             });
           }
         } catch (e) {
+          console.error('Error processing message:', msg, e);
           return null;
         }
       }
+      console.warn('Skipping invalid message:', msg);
       return null;
     }).filter(msg => msg !== null);
 
@@ -319,36 +329,25 @@ async function initializeChatHistory(state) {
   }
 }
 
-// Node: Retrieve documents (using dynamic_data)
+// Node: Retrieve documents
 async function retrieveDocuments(state) {
   try {
-    console.log('🔍 [retrieveDocuments] Starting document retrieval for query:', state.user_query);
-    let documents = [];
-    
-    // Skip document retrieval if dynamic_data has prompt and apiCurl (will use API route)
-    const hasApiConfig = state.dynamic_data && state.dynamic_data.some(item => 
-      typeof item === 'object' && item !== null && (item.prompt && item.apiCurl)
-    );
-    
-    if (hasApiConfig) {
-      console.log('🔍 [retrieveDocuments] API config detected, skipping vector store retrieval');
-    } else {
-      console.log('🔍 [retrieveDocuments] Using vector store retrieval');
-      // Use vector store retrieval
-      const collectionName = `org-${state.organisation_id}`;
-      const embeddingModel = createEmbeddingModel(state.openai_api_key);
-      const vectorStore = await getOrCreateCollection(collectionName, embeddingModel);
-      const retriever = vectorStore.asRetriever({
-        searchType: 'mmr',
-        search_kwargs: {
-          filter: { organisation_id: state.organisation_id },
-          k: 4,
-        },
-      });
-      documents = await retriever.getRelevantDocuments(state.user_query);
-      console.log('🔍 [retrieveDocuments] Retrieved', documents.length, 'documents from vector store');
-    }
-    
+    const collectionName = `org-${state.organisation_id}`;
+    const embeddingModel = createEmbeddingModel(state.openai_api_key);
+    const vectorStore = await getOrCreateCollection(collectionName, embeddingModel);
+    const retriever = vectorStore.asRetriever({
+      searchType: 'mmr',
+      search_kwargs: {
+        filter: { organisation_id: state.organisation_id },
+        k: 4,
+      },
+    });
+
+    console.log('Retriever:', retriever);
+    console.log('Query:', state.user_query);
+    const documents = await retriever.getRelevantDocuments(state.user_query);
+    console.log('Retrieved Documents:', documents);
+
     return { documents };
   } catch (error) {
     console.error('Error in retrieveDocuments:', error);
@@ -358,9 +357,9 @@ async function retrieveDocuments(state) {
 
 // Node: Filter FAQs
 async function filterFAQs(state) {
-  console.log('❓ [filterFAQs] Filtering FAQs, total FAQs:', state.faqs?.length || 0);
   let relevantFAQs = [];
   if (state.faqs && state.faqs.length > 0) {
+    console.log('Searching through', state.faqs.length, 'FAQs');
     relevantFAQs = state.faqs.filter(faq => {
       const question = faq.question?.toLowerCase() || '';
       const answer = faq.answer?.toLowerCase() || '';
@@ -368,14 +367,13 @@ async function filterFAQs(state) {
       const queryWords = query.split(' ').filter(word => word.length > 2);
       return queryWords.some(word => question.includes(word) || answer.includes(word));
     });
-    console.log('❓ [filterFAQs] Found', relevantFAQs.length, 'relevant FAQs');
+    console.log('Found', relevantFAQs.length, 'relevant FAQs');
   }
   return { faqs: relevantFAQs };
 }
 
 // Node: Create context
 async function createContext(state) {
-  console.log('📝 [createContext] Creating context from documents and FAQs');
   const documentContext = state.documents.map(doc => doc.pageContent).join('\n\n');
   const faqContext = state.faqs.length > 0
     ? '\n\nRelevant FAQs:\n' + state.faqs.map(faq => `Q: ${faq.question}\nA: ${faq.answer}`).join('\n\n')
@@ -395,751 +393,96 @@ async function createContext(state) {
     agentInfo = '\n\nAgent Information: No agents currently available';
   }
 
+  console.log('Agent Info being sent to AI:', agentInfo);
+  console.log('FAQ context being sent to AI:', faqContext ? 'Yes' : 'No');
+
   const fullContext = documentContext + faqContext + agentInfo;
-  console.log('📝 [createContext] Context created, length:', fullContext.length, 'characters');
   return { context: fullContext };
 }
 
-// Helper function to analyze data structure and extract key information
-function analyzeDataStructure(items) {
-  if (!Array.isArray(items) || items.length === 0) {
-    return { fields: [], hasNestedObjects: false };
-  }
-
-  // Sample first few items to understand structure
-  const sampleSize = Math.min(3, items.length);
-  const samples = items.slice(0, sampleSize);
-  
-  // Collect all unique keys from all items
-  const allKeys = new Set();
-  let hasNestedObjects = false;
-  
-  samples.forEach(item => {
-    if (typeof item === 'object' && item !== null) {
-      Object.keys(item).forEach(key => {
-        allKeys.add(key);
-        // Check if value is an object (nested)
-        if (item[key] && typeof item[key] === 'object' && !Array.isArray(item[key])) {
-          hasNestedObjects = true;
-        }
-      });
-    }
-  });
-
-  // Prioritize common identifier fields
-  const priorityFields = ['name', 'title', 'firstname', 'lastname', 'email', 'id', 'emp_id', 'user_id'];
-  const commonFields = ['status', 'type', 'category', 'role', 'designation', 'manager', 'description'];
-  
-  // Find the best identifier field
-  let identifierField = null;
-  for (const field of priorityFields) {
-    if (allKeys.has(field)) {
-      identifierField = field;
-      break;
-    }
-  }
-  
-  // Collect other relevant fields (excluding nested objects and arrays)
-  const relevantFields = [];
-  allKeys.forEach(key => {
-    if (key !== identifierField) {
-      const sampleValue = samples[0]?.[key];
-      // Include if it's a simple value (not object/array) or if it's a common field
-      if (sampleValue !== null && sampleValue !== undefined) {
-        if (typeof sampleValue !== 'object' || commonFields.includes(key)) {
-          relevantFields.push(key);
-        }
-      }
-    }
-  });
-
-  return {
-    identifierField,
-    relevantFields: relevantFields.slice(0, 5), // Limit to 5 most relevant fields
-    hasNestedObjects,
-    allKeys: Array.from(allKeys)
-  };
-}
-
-// Helper function to format a single item based on its structure
-function formatItem(item, index, structure) {
-  if (typeof item !== 'object' || item === null) {
-    return `${index + 1}. ${item}`;
-  }
-
-  let formatted = `${index + 1}. `;
-  
-  // Get identifier value
-  let identifier = '';
-  if (structure.identifierField) {
-    const fieldValue = item[structure.identifierField];
-    if (fieldValue) {
-      if (typeof fieldValue === 'object' && fieldValue.name) {
-        identifier = fieldValue.name;
-      } else {
-        identifier = String(fieldValue);
-      }
-    }
-  }
-  
-  // If no identifier found, try to construct one from common fields
-  if (!identifier) {
-    if (item.firstname && item.lastname) {
-      identifier = `${item.firstname} ${item.lastname}`.trim();
-    } else if (item.name) {
-      identifier = item.name;
-    } else if (item.title) {
-      identifier = item.title;
-    } else if (item.email) {
-      identifier = item.email;
-    } else if (item.id) {
-      identifier = `Item ${item.id}`;
-    } else {
-      identifier = `Item ${index + 1}`;
-    }
-  }
-  
-  formatted += identifier;
-  
-  // Add relevant fields
-  structure.relevantFields.forEach(field => {
-    const value = item[field];
-    if (value !== null && value !== undefined && value !== '') {
-      let displayValue = value;
-      
-      // Handle nested objects (like designation.name)
-      if (typeof value === 'object' && !Array.isArray(value)) {
-        if (value.name) {
-          displayValue = value.name;
-        } else if (value.title) {
-          displayValue = value.title;
-        } else {
-          displayValue = JSON.stringify(value).substring(0, 30);
-        }
-      }
-      // Handle arrays
-      else if (Array.isArray(value)) {
-        displayValue = `${value.length} item(s)`;
-      }
-      // Handle long strings
-      else if (typeof value === 'string' && value.length > 50) {
-        displayValue = value.substring(0, 50) + '...';
-      }
-      
-      formatted += ` - ${field}: ${displayValue}`;
-    }
-  });
-  
-  return formatted;
-}
-
-// Helper function to format object response in human-readable format
-function formatObjectResponse(obj) {
-  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
-    return String(obj);
-  }
-
-  let response = '';
-  const keys = Object.keys(obj);
-  
-  if (keys.length === 0) {
-    return 'No information available.';
-  }
-
-  // If it's a simple object with just a few fields, format it naturally
-  if (keys.length <= 5) {
-    const parts = [];
-    keys.forEach(key => {
-      let value = obj[key];
-      
-      // Format the value appropriately
-      if (value === null || value === undefined) {
-        return; // Skip null/undefined
-      } else if (typeof value === 'object' && !Array.isArray(value)) {
-        if (value.name) {
-          value = value.name;
-        } else if (value.title) {
-          value = value.title;
-        } else {
-          value = JSON.stringify(value).substring(0, 50);
-        }
-      } else if (Array.isArray(value)) {
-        value = `${value.length} item(s)`;
-      } else if (typeof value === 'string' && value.length > 100) {
-        value = value.substring(0, 100) + '...';
-      }
-      
-      const fieldLabel = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-      parts.push(`${fieldLabel}: ${value}`);
-    });
-    
-    if (parts.length > 0) {
-      response = parts.join('. ') + '.';
-    }
-  } else {
-    // For complex objects, show key information
-    const importantFields = ['name', 'title', 'id', 'status', 'message', 'description', 'result'];
-    let foundImportant = false;
-    
-    importantFields.forEach(field => {
-      if (obj[field] !== undefined && obj[field] !== null) {
-        if (!foundImportant) {
-          response = `Here's what I found:\n\n`;
-          foundImportant = true;
-        }
-        const fieldLabel = field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-        let value = obj[field];
-        if (typeof value === 'object' && value.name) {
-          value = value.name;
-        }
-        response += `${fieldLabel}: ${value}\n`;
-      }
-    });
-    
-    if (!foundImportant) {
-      response = 'I received the information successfully.';
-    }
-  }
-
-  return response || 'Information retrieved successfully.';
-}
-
-// Helper function to format array response as a readable list
-function formatArrayResponse(dataArray) {
-  if (!Array.isArray(dataArray) || dataArray.length === 0) {
-    return 'I couldn\'t find any results for your query.';
-  }
-
-  const count = dataArray.length;
-  
-  // Analyze the data structure
-  const structure = analyzeDataStructure(dataArray);
-  console.log('📋 [formatArrayResponse] Data structure analysis:', {
-    identifierField: structure.identifierField,
-    relevantFields: structure.relevantFields,
-    totalItems: count
-  });
-
-  // Create a more human-readable response
-  let response = '';
-  
-  // Start with a natural introduction
-  if (count === 1) {
-    response = 'I found 1 result:\n\n';
-  } else {
-    response = `I found ${count} results. Here they are:\n\n`;
-  }
-
-  // Format each item in a conversational way
-  dataArray.forEach((item, index) => {
-    if (typeof item !== 'object' || item === null) {
-      response += `${index + 1}. ${item}\n`;
-      return;
-    }
-
-    // Get the main identifier
-    let mainIdentifier = '';
-    if (structure.identifierField) {
-      const fieldValue = item[structure.identifierField];
-      if (fieldValue) {
-        if (typeof fieldValue === 'object' && fieldValue.name) {
-          mainIdentifier = fieldValue.name;
-        } else {
-          mainIdentifier = String(fieldValue);
-        }
-      }
-    }
-    
-    // Fallback identifier construction
-    if (!mainIdentifier) {
-      if (item.firstname && item.lastname) {
-        mainIdentifier = `${item.firstname} ${item.lastname}`.trim();
-      } else if (item.name) {
-        mainIdentifier = item.name;
-      } else if (item.title) {
-        mainIdentifier = item.title;
-      } else if (item.email) {
-        mainIdentifier = item.email;
-      } else if (item.id) {
-        mainIdentifier = `Item #${item.id}`;
-      } else {
-        mainIdentifier = `Result ${index + 1}`;
-      }
-    }
-
-    // Build a natural sentence for each item
-    let itemText = `${index + 1}. ${mainIdentifier}`;
-    const details = [];
-
-    // Add relevant details in a natural way
-    structure.relevantFields.forEach(field => {
-      const value = item[field];
-      if (value !== null && value !== undefined && value !== '') {
-        let displayValue = value;
-        
-        // Handle nested objects
-        if (typeof value === 'object' && !Array.isArray(value)) {
-          if (value.name) {
-            displayValue = value.name;
-          } else if (value.title) {
-            displayValue = value.title;
-          } else {
-            return; // Skip complex nested objects
-          }
-        }
-        // Handle arrays
-        else if (Array.isArray(value)) {
-          if (value.length > 0) {
-            displayValue = `${value.length} item(s)`;
-          } else {
-            return; // Skip empty arrays
-          }
-        }
-        // Handle long strings
-        else if (typeof value === 'string' && value.length > 50) {
-          displayValue = value.substring(0, 50) + '...';
-        }
-        
-        // Format field name in a human-readable way
-        const fieldLabel = field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-        details.push(`${fieldLabel}: ${displayValue}`);
-      }
-    });
-
-    // Combine details naturally
-    if (details.length > 0) {
-      if (details.length === 1) {
-        itemText += ` (${details[0]})`;
-      } else if (details.length <= 3) {
-        itemText += ` - ${details.join(', ')}`;
-      } else {
-        itemText += ` - ${details.slice(0, 3).join(', ')} and ${details.length - 3} more`;
-      }
-    }
-
-    response += itemText + '\n';
-  });
-
-  // Add a friendly closing if there are many results
-  if (count > 10) {
-    response += `\nThese are all ${count} results I found.`;
-  }
-
-  return response.trim();
-}
-
-// Helper function to parse curl command
-function parseCurl(curlString) {
-  const result = {
-    url: null,
-    method: 'GET', // Default to GET if no method specified
-    headers: {},
-    body: null
-  };
-
+// Node: Check for tool configuration
+async function checkToolConfiguration(state) {
   try {
-    // Normalize the curl string - handle multi-line and backslashes
-    const normalizedCurl = curlString.replace(/\\\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
-    
-    // Extract URL - handle various formats including GET requests without -X
-    const urlPatterns = [
-      /curl\s+(?:-X\s+\w+\s+)?['"]?([^\s'"]+https?:\/\/[^\s'"]+)['"]?/,
-      /curl\s+['"]?([^\s'"]+https?:\/\/[^\s'"]+)['"]?/,
-      /['"]?(https?:\/\/[^\s'"]+)['"]?/
-    ];
-    
-    for (const pattern of urlPatterns) {
-      const urlMatch = normalizedCurl.match(pattern);
-      if (urlMatch && urlMatch[1] && urlMatch[1].startsWith('http')) {
-        result.url = urlMatch[1].replace(/['"]/g, '');
-        break;
-      }
-    }
-
-    // Extract method - default to GET if not specified
-    const methodMatch = normalizedCurl.match(/-X\s+(\w+)/i);
-    if (methodMatch) {
-      result.method = methodMatch[1].toUpperCase();
-    }
-
-    // Extract headers - handle both quoted and unquoted, including multi-line
-    // Priority: quoted headers first (more reliable), then unquoted
-    const headerPatterns = [
-      /-H\s+['"]([^'"]+)['"]/g,  // Quoted headers: -H 'header: value'
-      /--header\s+['"]([^'"]+)['"]/g,  // --header 'header: value'
-      /-H\s+([^\s\\-]+)/g  // Unquoted headers (fallback)
-    ];
-    
-    for (const pattern of headerPatterns) {
-      const headerMatches = normalizedCurl.matchAll(pattern);
-      for (const match of headerMatches) {
-        const headerStr = match[1].replace(/['"]/g, '').trim();
-        const colonIndex = headerStr.indexOf(':');
-        if (colonIndex > 0) {
-          const key = headerStr.substring(0, colonIndex).trim();
-          const value = headerStr.substring(colonIndex + 1).trim();
-          if (key && value) {
-            // Preserve header exactly as provided (case-sensitive for some headers like Authorization)
-            result.headers[key] = value;
-          }
-        }
-      }
-    }
-    
-    console.log('🔧 [parseCurl] Extracted headers count:', Object.keys(result.headers).length);
-    if (result.headers['authorization'] || result.headers['Authorization']) {
-      const authHeader = result.headers['authorization'] || result.headers['Authorization'];
-      console.log('🔧 [parseCurl] Authorization header found:', authHeader.substring(0, 20) + '...');
-    }
-
-    // Extract body/data - handle various formats
-    const dataPatterns = [
-      /(?:-d|--data|--data-raw)\s+['"]([^'"]+)['"]/,
-      /(?:-d|--data|--data-raw)\s+([^\s\\]+)/,
-      /--data-binary\s+['"]([^'"]+)['"]/
-    ];
-    
-    for (const pattern of dataPatterns) {
-      const dataMatch = normalizedCurl.match(pattern);
-      if (dataMatch) {
-        const dataStr = dataMatch[1].replace(/['"]/g, '');
-        try {
-          result.body = JSON.parse(dataStr);
-        } catch {
-          result.body = dataStr;
-        }
-        break;
-      }
-    }
-
-    // If no Content-Type header is set and we have a body, set default
-    if (result.body && !result.headers['Content-Type'] && !result.headers['content-type']) {
-      result.headers['Content-Type'] = 'application/json';
-    }
-  } catch (error) {
-    console.error('Error parsing curl:', error);
-  }
-
-  return result;
-}
-
-// Node: Check API Trigger (MODEL ROUTER)
-async function checkApiTrigger(state) {
-  try {
-    console.log('🔀 [checkApiTrigger] Starting router decision');
-    let route = "rag"; // default route
-    
-    if (state.dynamic_data && state.dynamic_data.length > 0) {
-      console.log('🔀 [checkApiTrigger] Checking dynamic_data for API config, items:', state.dynamic_data.length);
-      // Find item with prompt and apiCurl
-      const apiConfig = state.dynamic_data.find(item => 
-        typeof item === 'object' && item !== null && item.prompt && item.apiCurl
-      );
-      
-      if (apiConfig) {
-        console.log('🔀 [checkApiTrigger] Found API config with prompt:', apiConfig.prompt);
-        console.log('🔀 [checkApiTrigger] Using LLM to check if query matches prompt');
-        // Use LLM to check if user query is related to the prompt
-        const chatModel = createChatModel(state.openai_api_key);
-        const checkPrompt = ChatPromptTemplate.fromMessages([
-          ['system', 'You are a routing assistant. Determine if the user query is related to the given prompt/topic. Respond with only "yes" or "no".'],
-          ['human', 'Prompt/Topic: {prompt}\n\nUser Query: {query}\n\nIs the user query related to the prompt? Respond with only "yes" or "no".']
-        ]);
-        
-        const chain = checkPrompt.pipe(chatModel);
-        const response = await chain.invoke({
-          prompt: apiConfig.prompt,
-          query: state.user_query
-        });
-        
-        const isRelated = response.content?.toLowerCase().trim().startsWith('yes');
-        console.log('🔀 [checkApiTrigger] LLM response:', response.content, '| Is related:', isRelated);
-        
-        if (isRelated) {
-          route = "api";
-          console.log('🔀 [checkApiTrigger] ✅ Routing to API path');
-        } else {
-          console.log('🔀 [checkApiTrigger] ❌ Query not related to prompt, routing to RAG path');
-        }
-      } else {
-        console.log('🔀 [checkApiTrigger] No API config (prompt + apiCurl) found in dynamic_data');
-      }
-    } else {
-      console.log('🔀 [checkApiTrigger] No dynamic_data provided');
-    }
-    
-    console.log('🔀 [checkApiTrigger] Final route decision:', route);
-    return { route };
-  } catch (error) {
-    console.error('Error in checkApiTrigger:', error);
-    return { route: "rag" };
-  }
-}
-
-// Node: Call External API
-async function callExternalApi(state) {
-  try {
-    console.log('📡 [callExternalApi] Starting external API call');
-    // Find API configuration from dynamic_data with prompt and apiCurl
-    const apiConfig = state.dynamic_data.find(item => 
-      typeof item === 'object' && item !== null && item.prompt && item.apiCurl
+    // Use AI to extract tool configuration from user query
+    const toolConfig = await extractToolConfiguration(
+      state.user_query,
+      state.openai_api_key
     );
-    
-    if (!apiConfig || !apiConfig.apiCurl) {
-      throw new Error('No API configuration (apiCurl) found in dynamic_data');
-    }
-    
-    console.log('📡 [callExternalApi] Parsing curl command');
-    // Parse curl command
-    const curlConfig = parseCurl(apiConfig.apiCurl);
-    
-    if (!curlConfig.url) {
-      throw new Error('Could not extract URL from apiCurl');
-    }
-    
-    console.log('📡 [callExternalApi] API URL:', curlConfig.url);
-    console.log('📡 [callExternalApi] API Method:', curlConfig.method);
-    console.log('📡 [callExternalApi] API Headers count:', Object.keys(curlConfig.headers).length);
-    // Log headers but mask sensitive tokens
-    const headersForLog = {};
-    for (const [key, value] of Object.entries(curlConfig.headers)) {
-      if (key.toLowerCase() === 'authorization' || key.toLowerCase().includes('token')) {
-        headersForLog[key] = value.substring(0, 20) + '...' + value.substring(value.length - 10);
-      } else {
-        headersForLog[key] = value;
-      }
-    }
-    console.log('📡 [callExternalApi] API Headers:', JSON.stringify(headersForLog));
-    
-    // Verify authorization header is present
-    if (curlConfig.headers['authorization'] || curlConfig.headers['Authorization']) {
-      console.log('📡 [callExternalApi] ✅ Authorization token found in headers');
-    } else {
-      console.log('📡 [callExternalApi] ⚠️ No authorization header found');
-    }
-    
-    // Prepare request - only add body for POST, PUT, PATCH methods
-    let requestBody = null;
-    const methodsWithBody = ['POST', 'PUT', 'PATCH'];
-    
-    if (methodsWithBody.includes(curlConfig.method)) {
-      requestBody = curlConfig.body || {};
-      
-      // If body is a string, try to parse it, otherwise use as template
-      if (typeof requestBody === 'string') {
-        try {
-          requestBody = JSON.parse(requestBody);
-        } catch {
-          // If not JSON, use it as template and replace placeholders
-          requestBody = {
-            query: state.user_query,
-            user_query: state.user_query,
-            organisation_id: state.organisation_id,
-            context: state.context,
-            chat_history: state.chat_history,
-          };
-        }
-      } else if (typeof requestBody === 'object') {
-        // Merge user query and context into existing body
-        requestBody = {
-          ...requestBody,
-          query: state.user_query,
-          user_query: state.user_query,
-          organisation_id: state.organisation_id,
-          context: state.context,
-          chat_history: state.chat_history,
-        };
-      } else {
-        requestBody = {
-          query: state.user_query,
-          organisation_id: state.organisation_id,
-          context: state.context,
-          chat_history: state.chat_history,
-        };
-      }
-      console.log('📡 [callExternalApi] Request body:', JSON.stringify(requestBody));
-    } else {
-      console.log('📡 [callExternalApi] GET request - no body will be sent');
-    }
-    
-    console.log('📡 [callExternalApi] Making API request...');
-    
-    const response = await fetch(curlConfig.url, {
-      method: curlConfig.method,
-      headers: curlConfig.headers,
-      body: requestBody ? JSON.stringify(requestBody) : undefined,
-    });
-    
-    console.log('📡 [callExternalApi] API response status:', response.status, response.statusText);
-    
-    if (!response.ok) {
-      // Log the error but don't expose it to user - fall back to RAG
-      console.error('📡 [callExternalApi] API call failed with status:', response.status, response.statusText);
-      console.log('📡 [callExternalApi] Falling back to RAG response generation');
-      
-      // Fall back to RAG response generation
-      return await generateResponse(state);
-    }
-    
-    let apiResponse;
-    try {
-      const responseText = await response.text();
-      if (responseText) {
-        apiResponse = JSON.parse(responseText);
-      } else {
-        throw new Error('Empty response from API');
-      }
-    } catch (parseError) {
-      console.error('📡 [callExternalApi] Failed to parse API response:', parseError);
-      console.log('📡 [callExternalApi] Falling back to RAG response generation');
-      // Fall back to RAG if response parsing fails
-      return await generateResponse(state);
-    }
-    
-    console.log('📡 [callExternalApi] API response received:', JSON.stringify(apiResponse).substring(0, 200) + '...');
-    
-    // Use LLM to analyze API response and answer the user's query
-    console.log('📡 [callExternalApi] Using LLM to analyze API response and answer query');
-    
-    let answer;
-    try {
-      const chatModel = createChatModel(state.openai_api_key);
-      const analysisPrompt = ChatPromptTemplate.fromMessages([
-        ['system', `You are a helpful assistant. Analyze the COMPLETE API response data and answer the user's query based on that data. 
 
-CRITICAL INSTRUCTIONS:
-- You have been provided with the COMPLETE API response data - search through ALL of it
-- If the data is an array, you must examine EVERY SINGLE ITEM in the array, not just the first few
-- If the query asks about a specific person/thing, search through ALL items in the array to find them
-- Check ALL fields in each item: firstname, lastname, email, manager_name, hr_manager_name, user.firstname, user.lastname, etc.
-- Names may appear in different formats - search for partial matches (e.g., "Isha" or "Agrawal" separately)
-- Provide a clear, concise, and human-readable answer based on what you find
-- If you find the person, describe their role, designation, status, manager, and any relevant details
-- If the query asks for a list, provide a formatted list
-- Be conversational and natural in your response
-- Only use information from the provided API data
-- IMPORTANT: The data provided is COMPLETE - search through ALL of it thoroughly`],
-        ['human', `User Query: {query}
-
-COMPLETE API Response Data (search through ALL items):
-{apiData}
-
-IMPORTANT: This is the COMPLETE API response. Search through EVERY SINGLE ITEM in the data above to answer the user's query. Do not skip any items.`]
-      ]);
-      
-      // Send the COMPLETE API response to LLM - don't truncate
-      // Modern LLMs can handle large contexts, so send everything
-      let apiDataForLLM = JSON.stringify(apiResponse);
-      
-      // Only truncate if it's extremely large (over 100k chars) - but still send a large sample
-      const maxLength = 100000; // Much larger limit
-      if (apiDataForLLM.length > maxLength) {
-        console.log('📡 [callExternalApi] Response is very large (' + apiDataForLLM.length + ' chars), but sending as much as possible');
-        // For very large arrays, send a larger sample
-        if (Array.isArray(apiResponse)) {
-          // Send first 100 items instead of just 10
-          const sampleSize = Math.min(100, apiResponse.length);
-          const sample = apiResponse.slice(0, sampleSize);
-          apiDataForLLM = JSON.stringify({
-            total_count: apiResponse.length,
-            items_sent: sampleSize,
-            data: sample,
-            note: `Sending ${sampleSize} of ${apiResponse.length} items. Please search through ALL items provided.`
-          });
-        } else {
-          apiDataForLLM = apiDataForLLM.substring(0, maxLength);
-        }
-      } else {
-        console.log('📡 [callExternalApi] Sending complete API response to LLM (' + apiDataForLLM.length + ' characters)');
-      }
-      
-      const analysisChain = analysisPrompt.pipe(chatModel);
-      const llmResponse = await analysisChain.invoke({
-        query: state.user_query,
-        apiData: apiDataForLLM
-      });
-      
-      answer = llmResponse.content;
-      console.log('📡 [callExternalApi] LLM generated answer from API data');
-      
-      // Validate that we got a meaningful answer
-      if (!answer || answer.trim().length === 0) {
-        console.log('📡 [callExternalApi] LLM returned empty answer, falling back to formatting');
-        // Fallback to formatting if LLM fails
-        answer = formatArrayResponse(Array.isArray(apiResponse) ? apiResponse : (apiResponse.data || apiResponse.results || []));
-      }
-    } catch (llmError) {
-      console.error('📡 [callExternalApi] Error using LLM to analyze response:', llmError);
-      console.log('📡 [callExternalApi] Falling back to direct formatting');
-      
-      // Fallback to direct formatting if LLM fails
-      answer = apiResponse.answer || apiResponse.response || apiResponse.data?.answer || apiResponse.message || apiResponse.text;
-      
-      if (!answer) {
-        if (typeof apiResponse === 'string') {
-          answer = apiResponse;
-        } else if (Array.isArray(apiResponse)) {
-          answer = formatArrayResponse(apiResponse);
-        } else if (apiResponse.data && Array.isArray(apiResponse.data)) {
-          answer = formatArrayResponse(apiResponse.data);
-        } else if (apiResponse.results && Array.isArray(apiResponse.results)) {
-          answer = formatArrayResponse(apiResponse.results);
-        } else {
-          answer = formatObjectResponse(apiResponse);
-        }
-      } else if (Array.isArray(answer)) {
-        answer = formatArrayResponse(answer);
-      }
-    }
-    
-    // Validate that we got a meaningful answer
-    if (!answer || answer.trim().length === 0) {
-      console.log('📡 [callExternalApi] Empty or invalid answer from API, falling back to RAG');
-      return await generateResponse(state);
-    }
-    
-    const taskCreation = apiResponse.task_creation || false;
-    const connectAgent = apiResponse.connect_agent || false;
-    
-    console.log('📡 [callExternalApi] Extracted answer length:', answer?.length || 0);
-    console.log('📡 [callExternalApi] Task creation:', taskCreation, '| Connect agent:', connectAgent);
-    
-    // Update chat history
-    console.log('📡 [callExternalApi] Updating chat history');
-    const chatHistory = await getSessionChatHistory(state.organisation_id);
-    await chatHistory.addMessage(new HumanMessage({ content: state.user_query, name: state.organisation_id }));
-    await chatHistory.addMessage(new AIMessage({ content: answer, name: state.organisation_id }));
-    
-    console.log('📡 [callExternalApi] ✅ API call completed successfully');
-    return {
-      answer: answer,
-      task_creation: taskCreation,
-      connect_agent: connectAgent,
-    };
-  } catch (error) {
-    // Catch any other errors (network, timeout, etc.) and fall back to RAG
-    console.error('📡 [callExternalApi] Error occurred:', error.message);
-    console.log('📡 [callExternalApi] Falling back to RAG response generation');
-    
-    // Fall back to RAG response generation instead of showing error
-    try {
-      return await generateResponse(state);
-    } catch (ragError) {
-      console.error('📡 [callExternalApi] RAG fallback also failed:', ragError);
-      // Last resort - return a generic helpful message
+    if (toolConfig && toolConfig.hasToolConfig) {
+      console.log('Tool configuration detected:', toolConfig);
       return {
-        answer: "I'm having trouble accessing that information right now. Could you please rephrase your question?",
-        task_creation: false,
-        connect_agent: false,
+        tool_configuration: true,
+        tool_config_data: toolConfig,
       };
     }
+
+    return {
+      tool_configuration: false,
+      tool_config_data: null,
+    };
+  } catch (error) {
+    console.error('Error checking tool configuration:', error);
+    return {
+      tool_configuration: false,
+      tool_config_data: null,
+    };
+  }
+}
+
+// Node: Process tool configuration
+async function processToolConfiguration(state) {
+  try {
+    if (!state.tool_config_data || !state.tool_config_data.hasToolConfig) {
+      return {
+        answer: "I couldn't extract the tool configuration details. Please provide: what the tool does, the API URL, and authentication information.",
+        tool_configuration: false,
+      };
+    }
+
+    const toolConfig = state.tool_config_data;
+    
+    // Validate and save tool configuration
+    const saveResult = await saveToolConfiguration(
+      toolConfig,
+      state.organisation_id,
+      state.user_id,
+      state.backend_api_url || process.env.BACKEND_API_URL || 'http://localhost:5003',
+      state.auth_token
+    );
+
+    if (saveResult.success) {
+      return {
+        answer: `Great! I've successfully configured and saved your tool. The tool "${toolConfig.prompt}" is now set up to call ${toolConfig.url}. The API has been validated and saved to your configuration.`,
+        tool_configuration: true,
+      };
+    } else {
+      return {
+        answer: `I encountered an issue while saving your tool configuration: ${saveResult.error}. Please check the API URL and authentication details, then try again.`,
+        tool_configuration: false,
+      };
+    }
+  } catch (error) {
+    console.error('Error processing tool configuration:', error);
+    return {
+      answer: "Sorry, I encountered an error while processing your tool configuration. Please try again.",
+      tool_configuration: false,
+    };
   }
 }
 
 // Node: Generate response
 async function generateResponse(state) {
   try {
-    console.log('🤖 [generateResponse] Starting RAG response generation');
+    // If tool configuration is being processed, skip normal response generation
+    if (state.tool_configuration && state.tool_config_data) {
+      return {
+        answer: state.answer || "Processing tool configuration...",
+        task_creation: false,
+        connect_agent: false,
+      };
+    }
+
     const prompt = ChatPromptTemplate.fromMessages([
       ['system', ACT_PROMPT],
       ['human', '{chat_history}\n\nContext:\n{context}\n\nQuestion:\n{question}'],
@@ -1148,9 +491,9 @@ async function generateResponse(state) {
     const chatModel = createChatModel(state.openai_api_key);
     const ragChain = prompt.pipe(chatModel).pipe(new JsonOutputParser());
 
-    const chatHistory = await getSessionChatHistory(state.organisation_id);
+    const historyDb = await connectHistoryDb();
+    const chatHistory = await getSessionChatHistory(historyDb, state.organisation_id);
 
-    console.log('🤖 [generateResponse] Invoking LLM with context length:', state.context.length);
     const generation = await ragChain.invoke({
       question: state.user_query,
       context: state.context,
@@ -1158,19 +501,16 @@ async function generateResponse(state) {
       agent_status: state.agents_available,
     });
 
-    console.log('🤖 [generateResponse] LLM generation received');
-    console.log('🤖 [generateResponse] Answer length:', generation.answer?.length || 0);
-    console.log('🤖 [generateResponse] Task creation:', generation.task_creation, '| Connect agent:', generation.connect_agent);
-
     // Add new messages to history
-    console.log('🤖 [generateResponse] Updating chat history');
     await chatHistory.addMessage(new HumanMessage({ content: state.user_query, name: state.organisation_id }));
     await chatHistory.addMessage(new AIMessage({ content: generation.answer, name: state.organisation_id }));
 
-    console.log('🤖 [generateResponse] ✅ RAG response generated successfully');
+    console.log('Generation:', generation);
+
     return {
       answer: generation.answer,
-      task_creation: generation.task_creation,
+      task_creation: generation.task_creation || false,
+      tool_configuration: generation.tool_configuration || false,
       connect_agent: generation.connect_agent || false,
     };
   } catch (error) {
@@ -1178,6 +518,7 @@ async function generateResponse(state) {
     return {
       answer: "Sorry, this query does not proceed.",
       task_creation: false,
+      tool_configuration: false,
       connect_agent: false,
     };
   }
@@ -1185,23 +526,20 @@ async function generateResponse(state) {
 
 // Node: Format output
 async function formatOutput(state) {
-  console.log('📤 [formatOutput] Formatting final output');
-  const output = {
+  return {
     message: state.answer ? 'Query processed successfully' : 'Query failed, fallback response sent',
     status: state.answer ? 200 : 500,
     question: state.user_query,
     answer: state.answer,
     task_creation: state.task_creation,
+    tool_configuration: state.tool_configuration,
     connect_agent: state.connect_agent,
   };
-  console.log('📤 [formatOutput] Final output status:', output.status);
-  console.log('📤 [formatOutput] Final output message:', output.message);
-  return output;
 }
 
-// Router function for conditional edges
-function routeDecision(state) {
-  return state.route || "rag";
+// Conditional edge function to route based on tool configuration
+function shouldProcessToolConfig(state) {
+  return state.tool_configuration ? "processToolConfiguration" : "generateResponse";
 }
 
 // Create the graph
@@ -1210,20 +548,20 @@ const graph = new StateGraph({ channels: ChatBotState })
   .addNode("retrieveDocuments", retrieveDocuments)
   .addNode("filterFAQs", filterFAQs)
   .addNode("createContext", createContext)
-  .addNode("checkApiTrigger", checkApiTrigger)
-  .addNode("callExternalApi", callExternalApi)
+  .addNode("checkToolConfiguration", checkToolConfiguration)
+  .addNode("processToolConfiguration", processToolConfiguration)
   .addNode("generateResponse", generateResponse)
   .addNode("formatOutput", formatOutput)
   .addEdge(START, "initializeChatHistory")
   .addEdge("initializeChatHistory", "retrieveDocuments")
   .addEdge("retrieveDocuments", "filterFAQs")
   .addEdge("filterFAQs", "createContext")
-  .addEdge("createContext", "checkApiTrigger")
-  .addConditionalEdges("checkApiTrigger", routeDecision, {
-    "api": "callExternalApi",
-    "rag": "generateResponse"
+  .addEdge("createContext", "checkToolConfiguration")
+  .addConditionalEdges("checkToolConfiguration", shouldProcessToolConfig, {
+    "processToolConfiguration": "processToolConfiguration",
+    "generateResponse": "generateResponse",
   })
-  .addEdge("callExternalApi", "formatOutput")
+  .addEdge("processToolConfiguration", "formatOutput")
   .addEdge("generateResponse", "formatOutput")
   .addEdge("formatOutput", END);
 
@@ -1233,18 +571,9 @@ const app = graph.compile();
 // Main function to invoke the graph
 const getResponse = async (data) => {
   try {
-    console.log('🚀 [getResponse] ========================================');
-    console.log('🚀 [getResponse] Starting request processing');
-    console.log('🚀 [getResponse] Organisation ID:', data.organisation_id);
-    console.log('🚀 [getResponse] User Query:', data.user_query);
-    console.log('🚀 [getResponse] FAQs count:', data.faqs?.length || 0);
-    console.log('🚀 [getResponse] Agents available:', data.agents_available);
-    console.log('🚀 [getResponse] Dynamic data items:', data.dynamic_data?.length || 0);
-    if (data.dynamic_data && data.dynamic_data.length > 0) {
-      console.log('🚀 [getResponse] Dynamic data:', JSON.stringify(data.dynamic_data).substring(0, 200) + '...');
-    }
-    console.log('🚀 [getResponse] ========================================');
-    
+    console.log('🚀 Starting chat processing with API key:', data.openai_api_key ? 'dynamic' : 'default');
+    console.log('Dynamic data:', data.dynamic_data);
+
     const result = await app.invoke({
       organisation_id: data.organisation_id,
       user_query: data.user_query,
@@ -1253,19 +582,20 @@ const getResponse = async (data) => {
       available_agents: data.available_agents || [],
       openai_api_key: data.openai_api_key || null,
       dynamic_data: data.dynamic_data || [],
+      user_id: data.user_id || null,
+      backend_api_url: data.backend_api_url || process.env.BACKEND_API_URL || null,
+      auth_token: data.auth_token || null,
     });
-    
-    console.log('🚀 [getResponse] ✅ Request processed successfully');
-    console.log('🚀 [getResponse] Final status:', result.status);
     return result;
   } catch (error) {
-    console.error('🚀 [getResponse] ❌ Error in getResponse:', error);
+    console.error('Error in getResponse:', error);
     return {
       message: 'Query failed, fallback response sent',
       status: 500,
       question: data.user_query,
       answer: "Sorry, this query does not proceed.",
       task_creation: false,
+      tool_configuration: false,
       connect_agent: false,
     };
   }

@@ -84,7 +84,18 @@ app.post('/api/organisation_database', async (req, res) => {
 });
 
 app.post('/api/organisation_chatbot', async (req, res) => {
-  const { organisation_id, user_query, agents_available, available_agents, faqs, openAiKey, dynamic_data } = req.body;
+  const { 
+    organisation_id, 
+    user_query, 
+    agents_available, 
+    available_agents, 
+    faqs, 
+    openAiKey, 
+    dynamic_data,
+    user_id,
+    backend_api_url,
+    auth_token
+  } = req.body;
 
   if (!user_query) {
     return res.status(400).json({ message: 'Missing query' });
@@ -96,6 +107,8 @@ app.post('/api/organisation_chatbot', async (req, res) => {
   console.log('Received request with FAQs:', faqs ? faqs.length : 0, 'FAQs');
   console.log('API Key provided:', openAiKey ? 'Yes (dynamic)' : 'No (will use default)');
   console.log('Dynamic data received from api call:', dynamic_data);
+  console.log('User ID:', user_id || 'Not provided');
+  console.log('Backend API URL:', backend_api_url || 'Using default/env');
 
   const data = {
     user_query,
@@ -105,6 +118,9 @@ app.post('/api/organisation_chatbot', async (req, res) => {
     faqs: faqs || [],
     openai_api_key: openAiKey || null,
     dynamic_data: dynamic_data || [],
+    user_id: user_id || null,
+    backend_api_url: backend_api_url || process.env.BACKEND_API_URL || null,
+    auth_token: auth_token || null,
   };
 
   try {
