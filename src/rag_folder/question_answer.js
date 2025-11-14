@@ -230,6 +230,7 @@ const ChatBotState = {
   user_query: null,
   documents: [],
   faqs: [],
+  dynamic_data: [],
   agents_available: false,
   available_agents: [],
   context: "",
@@ -469,8 +470,8 @@ const app = graph.compile();
 // Main function to invoke the graph
 const getResponse = async (data) => {
   try {
-    console.log('🚀 Starting chat processing with API key:', data.openai_api_key ? 'dynamic' : 'default');
-    
+    console.log('Dynamic data:', data.dynamic_data);
+
     const result = await app.invoke({
       organisation_id: data.organisation_id,
       user_query: data.user_query,
