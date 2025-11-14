@@ -404,64 +404,75 @@ async function createContext(state) {
 function parseCurl(curlString) {
   const result = {
     url: null,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    method: 'GET', // Default to GET if no method specified
+    headers: {},
     body: null
   };
 
   try {
-    // Extract URL - handle various formats
+    // Normalize the curl string - handle multi-line and backslashes
+    const normalizedCurl = curlString.replace(/\\\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
+    
+    // Extract URL - handle various formats including GET requests without -X
     const urlPatterns = [
-      /curl\s+(?:-X\s+\w+\s+)?['"]?([^\s'"]+)['"]?/,
-      /curl\s+['"]?([^'"]+)['"]?/,
-      /['"]?https?:\/\/[^\s'"]+['"]?/
+      /curl\s+(?:-X\s+\w+\s+)?['"]?([^\s'"]+https?:\/\/[^\s'"]+)['"]?/,
+      /curl\s+['"]?([^\s'"]+https?:\/\/[^\s'"]+)['"]?/,
+      /['"]?(https?:\/\/[^\s'"]+)['"]?/
     ];
     
     for (const pattern of urlPatterns) {
-      const urlMatch = curlString.match(pattern);
+      const urlMatch = normalizedCurl.match(pattern);
       if (urlMatch && urlMatch[1] && urlMatch[1].startsWith('http')) {
         result.url = urlMatch[1].replace(/['"]/g, '');
         break;
       }
     }
 
-    // Extract method
-    const methodMatch = curlString.match(/-X\s+(\w+)/i);
+    // Extract method - default to GET if not specified
+    const methodMatch = normalizedCurl.match(/-X\s+(\w+)/i);
     if (methodMatch) {
       result.method = methodMatch[1].toUpperCase();
     }
 
-    // Extract headers - handle both quoted and unquoted
+    // Extract headers - handle both quoted and unquoted, including multi-line
+    // Priority: quoted headers first (more reliable), then unquoted
     const headerPatterns = [
-      /-H\s+['"]([^'"]+)['"]/g,
-      /-H\s+([^\s]+)/g,
-      /--header\s+['"]([^'"]+)['"]/g
+      /-H\s+['"]([^'"]+)['"]/g,  // Quoted headers: -H 'header: value'
+      /--header\s+['"]([^'"]+)['"]/g,  // --header 'header: value'
+      /-H\s+([^\s\\-]+)/g  // Unquoted headers (fallback)
     ];
     
     for (const pattern of headerPatterns) {
-      const headerMatches = curlString.matchAll(pattern);
+      const headerMatches = normalizedCurl.matchAll(pattern);
       for (const match of headerMatches) {
-        const headerStr = match[1].replace(/['"]/g, '');
+        const headerStr = match[1].replace(/['"]/g, '').trim();
         const colonIndex = headerStr.indexOf(':');
         if (colonIndex > 0) {
           const key = headerStr.substring(0, colonIndex).trim();
           const value = headerStr.substring(colonIndex + 1).trim();
           if (key && value) {
+            // Preserve header exactly as provided (case-sensitive for some headers like Authorization)
             result.headers[key] = value;
           }
         }
       }
     }
+    
+    console.log('🔧 [parseCurl] Extracted headers count:', Object.keys(result.headers).length);
+    if (result.headers['authorization'] || result.headers['Authorization']) {
+      const authHeader = result.headers['authorization'] || result.headers['Authorization'];
+      console.log('🔧 [parseCurl] Authorization header found:', authHeader.substring(0, 20) + '...');
+    }
 
     // Extract body/data - handle various formats
     const dataPatterns = [
       /(?:-d|--data|--data-raw)\s+['"]([^'"]+)['"]/,
-      /(?:-d|--data|--data-raw)\s+([^\s]+)/,
+      /(?:-d|--data|--data-raw)\s+([^\s\\]+)/,
       /--data-binary\s+['"]([^'"]+)['"]/
     ];
     
     for (const pattern of dataPatterns) {
-      const dataMatch = curlString.match(pattern);
+      const dataMatch = normalizedCurl.match(pattern);
       if (dataMatch) {
         const dataStr = dataMatch[1].replace(/['"]/g, '');
         try {
@@ -471,6 +482,11 @@ function parseCurl(curlString) {
         }
         break;
       }
+    }
+
+    // If no Content-Type header is set and we have a body, set default
+    if (result.body && !result.headers['Content-Type'] && !result.headers['content-type']) {
+      result.headers['Content-Type'] = 'application/json';
     }
   } catch (error) {
     console.error('Error parsing curl:', error);
@@ -555,60 +571,103 @@ async function callExternalApi(state) {
     
     console.log('📡 [callExternalApi] API URL:', curlConfig.url);
     console.log('📡 [callExternalApi] API Method:', curlConfig.method);
-    console.log('📡 [callExternalApi] API Headers:', JSON.stringify(curlConfig.headers));
+    console.log('📡 [callExternalApi] API Headers count:', Object.keys(curlConfig.headers).length);
+    // Log headers but mask sensitive tokens
+    const headersForLog = {};
+    for (const [key, value] of Object.entries(curlConfig.headers)) {
+      if (key.toLowerCase() === 'authorization' || key.toLowerCase().includes('token')) {
+        headersForLog[key] = value.substring(0, 20) + '...' + value.substring(value.length - 10);
+      } else {
+        headersForLog[key] = value;
+      }
+    }
+    console.log('📡 [callExternalApi] API Headers:', JSON.stringify(headersForLog));
     
-    // Prepare request body - merge user query and context into the body
-    let requestBody = curlConfig.body || {};
+    // Verify authorization header is present
+    if (curlConfig.headers['authorization'] || curlConfig.headers['Authorization']) {
+      console.log('📡 [callExternalApi] ✅ Authorization token found in headers');
+    } else {
+      console.log('📡 [callExternalApi] ⚠️ No authorization header found');
+    }
     
-    // If body is a string, try to parse it, otherwise use as template
-    if (typeof requestBody === 'string') {
-      try {
-        requestBody = JSON.parse(requestBody);
-      } catch {
-        // If not JSON, use it as template and replace placeholders
+    // Prepare request - only add body for POST, PUT, PATCH methods
+    let requestBody = null;
+    const methodsWithBody = ['POST', 'PUT', 'PATCH'];
+    
+    if (methodsWithBody.includes(curlConfig.method)) {
+      requestBody = curlConfig.body || {};
+      
+      // If body is a string, try to parse it, otherwise use as template
+      if (typeof requestBody === 'string') {
+        try {
+          requestBody = JSON.parse(requestBody);
+        } catch {
+          // If not JSON, use it as template and replace placeholders
+          requestBody = {
+            query: state.user_query,
+            user_query: state.user_query,
+            organisation_id: state.organisation_id,
+            context: state.context,
+            chat_history: state.chat_history,
+          };
+        }
+      } else if (typeof requestBody === 'object') {
+        // Merge user query and context into existing body
         requestBody = {
+          ...requestBody,
           query: state.user_query,
           user_query: state.user_query,
           organisation_id: state.organisation_id,
           context: state.context,
           chat_history: state.chat_history,
         };
+      } else {
+        requestBody = {
+          query: state.user_query,
+          organisation_id: state.organisation_id,
+          context: state.context,
+          chat_history: state.chat_history,
+        };
       }
-    } else if (typeof requestBody === 'object') {
-      // Merge user query and context into existing body
-      requestBody = {
-        ...requestBody,
-        query: state.user_query,
-        user_query: state.user_query,
-        organisation_id: state.organisation_id,
-        context: state.context,
-        chat_history: state.chat_history,
-      };
+      console.log('📡 [callExternalApi] Request body:', JSON.stringify(requestBody));
     } else {
-      requestBody = {
-        query: state.user_query,
-        organisation_id: state.organisation_id,
-        context: state.context,
-        chat_history: state.chat_history,
-      };
+      console.log('📡 [callExternalApi] GET request - no body will be sent');
     }
     
-    console.log('📡 [callExternalApi] Request body:', JSON.stringify(requestBody));
     console.log('📡 [callExternalApi] Making API request...');
     
     const response = await fetch(curlConfig.url, {
       method: curlConfig.method,
       headers: curlConfig.headers,
-      body: curlConfig.method !== 'GET' ? JSON.stringify(requestBody) : undefined,
+      body: requestBody ? JSON.stringify(requestBody) : undefined,
     });
     
     console.log('📡 [callExternalApi] API response status:', response.status, response.statusText);
     
     if (!response.ok) {
-      throw new Error(`API call failed: ${response.status} ${response.statusText}`);
+      // Log the error but don't expose it to user - fall back to RAG
+      console.error('📡 [callExternalApi] API call failed with status:', response.status, response.statusText);
+      console.log('📡 [callExternalApi] Falling back to RAG response generation');
+      
+      // Fall back to RAG response generation
+      return await generateResponse(state);
     }
     
-    const apiResponse = await response.json();
+    let apiResponse;
+    try {
+      const responseText = await response.text();
+      if (responseText) {
+        apiResponse = JSON.parse(responseText);
+      } else {
+        throw new Error('Empty response from API');
+      }
+    } catch (parseError) {
+      console.error('📡 [callExternalApi] Failed to parse API response:', parseError);
+      console.log('📡 [callExternalApi] Falling back to RAG response generation');
+      // Fall back to RAG if response parsing fails
+      return await generateResponse(state);
+    }
+    
     console.log('📡 [callExternalApi] API response received:', JSON.stringify(apiResponse).substring(0, 200) + '...');
     
     // Extract answer from API response - support multiple formats
@@ -618,9 +677,18 @@ async function callExternalApi(state) {
     if (!answer) {
       if (typeof apiResponse === 'string') {
         answer = apiResponse;
+      } else if (Array.isArray(apiResponse)) {
+        // If response is an array, format it nicely
+        answer = `I found ${apiResponse.length} result(s). ${JSON.stringify(apiResponse).substring(0, 500)}`;
       } else {
         answer = JSON.stringify(apiResponse);
       }
+    }
+    
+    // Validate that we got a meaningful answer
+    if (!answer || answer.trim().length === 0) {
+      console.log('📡 [callExternalApi] Empty or invalid answer from API, falling back to RAG');
+      return await generateResponse(state);
     }
     
     const taskCreation = apiResponse.task_creation || false;
@@ -642,12 +710,22 @@ async function callExternalApi(state) {
       connect_agent: connectAgent,
     };
   } catch (error) {
-    console.error('Error in callExternalApi:', error);
-    return {
-      answer: `Sorry, I encountered an error calling the external API: ${error.message}`,
-      task_creation: false,
-      connect_agent: false,
-    };
+    // Catch any other errors (network, timeout, etc.) and fall back to RAG
+    console.error('📡 [callExternalApi] Error occurred:', error.message);
+    console.log('📡 [callExternalApi] Falling back to RAG response generation');
+    
+    // Fall back to RAG response generation instead of showing error
+    try {
+      return await generateResponse(state);
+    } catch (ragError) {
+      console.error('📡 [callExternalApi] RAG fallback also failed:', ragError);
+      // Last resort - return a generic helpful message
+      return {
+        answer: "I'm having trouble accessing that information right now. Could you please rephrase your question?",
+        task_creation: false,
+        connect_agent: false,
+      };
+    }
   }
 }
 
