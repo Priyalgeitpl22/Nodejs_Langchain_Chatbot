@@ -866,7 +866,8 @@ Respond with only "yes" or "no".`],
         
         const chain = checkPrompt.pipe(chatModel);
         
-        // Check each API config to find a match
+        // Check ALL API configs to find matches (don't stop at first match)
+        const matches = [];
         for (const apiConfig of apiConfigs) {
           console.log('🔀 [checkApiTrigger] Checking config with prompt:', apiConfig.prompt);
           const response = await chain.invoke({
@@ -878,14 +879,81 @@ Respond with only "yes" or "no".`],
           console.log('🔀 [checkApiTrigger] LLM response for prompt "' + apiConfig.prompt + '":', response.content, '| Is related:', isRelated);
           
           if (isRelated) {
-            matchedApiConfig = apiConfig;
-            route = "api";
-            console.log('🔀 [checkApiTrigger] ✅ Found matching API config, routing to API path');
-            break; // Stop checking once we find a match
+            matches.push({
+              config: apiConfig,
+              prompt: apiConfig.prompt,
+              response: response.content
+            });
+            console.log('🔀 [checkApiTrigger] ✅ Found matching API config');
           }
         }
         
-        if (route === "rag") {
+        // If multiple matches, use LLM to select the best one
+        if (matches.length > 1) {
+          console.log('🔀 [checkApiTrigger] Found', matches.length, 'matching configs, selecting best match');
+          const selectionPrompt = ChatPromptTemplate.fromMessages([
+            ['system', `You are a routing assistant. Given multiple API configurations that could match a user query, select the ONE that is MOST RELEVANT and SPECIFIC to the query.
+
+IMPORTANT RULES:
+1. If one prompt mentions a SPECIFIC person by name and the query is about that person, prefer that over general prompts
+2. If one prompt is more specific to the query topic, prefer that over generic prompts
+3. If prompts are equally relevant, prefer the first one in the list
+4. Respond with ONLY the index number (0-based) of the best match
+
+Examples:
+- Query: "tell me about priyal garg"
+- Prompt 0: "user information" (general)
+- Prompt 1: "This is information about priyal garg" (specific person)
+- Answer: 1 (specific person match is better)
+
+- Query: "get all users"
+- Prompt 0: "user information" (matches)
+- Prompt 1: "employee information" (matches but less specific)
+- Answer: 0 (user information is more specific)`],
+            ['human', `User Query: {query}
+
+Available API Configurations:
+{configs}
+
+Select the index (0-based) of the BEST matching configuration. Respond with ONLY the number.`]
+          ]);
+          
+          const configsText = matches.map((match, idx) => 
+            `[${idx}] Prompt: "${match.prompt}"`
+          ).join('\n');
+          
+          const selectionChain = selectionPrompt.pipe(chatModel);
+          const selectionResponse = await selectionChain.invoke({
+            query: state.user_query,
+            configs: configsText
+          });
+          
+          // Extract index from response
+          const indexMatch = selectionResponse.content?.match(/\d+/);
+          if (indexMatch) {
+            const selectedIndex = parseInt(indexMatch[0]);
+            if (selectedIndex >= 0 && selectedIndex < matches.length) {
+              matchedApiConfig = matches[selectedIndex].config;
+              route = "api";
+              console.log('🔀 [checkApiTrigger] Selected best match at index', selectedIndex, 'with prompt:', matchedApiConfig.prompt);
+            } else {
+              // Fallback to first match if index is invalid
+              matchedApiConfig = matches[0].config;
+              route = "api";
+              console.log('🔀 [checkApiTrigger] Invalid index, using first match');
+            }
+          } else {
+            // Fallback to first match if no index found
+            matchedApiConfig = matches[0].config;
+            route = "api";
+            console.log('🔀 [checkApiTrigger] Could not parse index, using first match');
+          }
+        } else if (matches.length === 1) {
+          // Single match - use it
+          matchedApiConfig = matches[0].config;
+          route = "api";
+          console.log('🔀 [checkApiTrigger] ✅ Found single matching API config, routing to API path');
+        } else {
           console.log('🔀 [checkApiTrigger] ❌ No API config matched the query, routing to RAG path');
         }
       } else {
